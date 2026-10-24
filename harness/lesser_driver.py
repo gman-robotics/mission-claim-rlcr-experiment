@@ -291,7 +291,7 @@ class Episode:
         cmd = ("source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed && "
                "python -m pytest -q -p no:cacheprovider " + files)
         rc, out, err = self.sb.run(cmd, 900)
-        summary = [l for l in out.splitlines() if re.search(r"\d+ (passed|failed|errors?)\b.* in [\d.]+s", l)]
+        summary = [l for l in out.splitlines() if re.search(r"\d+ (passed|failed|errors?)\b.* in [\d.]+ ?s", l)]
         last = summary[-1] if summary else ""
         ok = (rc == 0 and bool(re.search(r"\b\d+ passed\b", last))
               and not re.search(r"\b\d+ (failed|errors?)\b", last))
