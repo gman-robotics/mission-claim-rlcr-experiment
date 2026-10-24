@@ -17,7 +17,10 @@ import tempfile
 import threading
 import time
 
-EXPECTED_INSTANCE = "pallets__flask-5014"
+INSTANCES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "instances")
+ALLOWED_INSTANCES = frozenset(
+    name[:-5] for name in os.listdir(INSTANCES_DIR) if name.endswith(".json")
+) if os.path.isdir(INSTANCES_DIR) else frozenset()
 HOST_CANARY = "/tmp/gma392-host-canary"
 EXEC_MCP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exec_mcp.py")
 SUMMARY_STATUSES = (
@@ -290,7 +293,8 @@ def load_instance(path):
         log("abort: instance JSON must be an object")
         raise SystemExit(2)
     instance_id = data.get("instance_id")
-    if instance_id != EXPECTED_INSTANCE:
+    stem = os.path.basename(path)[:-5] if path.endswith(".json") else None
+    if instance_id not in ALLOWED_INSTANCES or stem != instance_id:
         log("abort: unexpected or missing instance_id: %r" % instance_id)
         raise SystemExit(2)
     commit = data.get("base_commit")
@@ -328,6 +332,7 @@ def parse_args(argv):
     parser.add_argument("--claude-bin", default="/opt/homebrew/bin/claude")
     parser.add_argument("--driver", choices=("claude", "openrouter", "ollama"), default="claude")
     parser.add_argument("--key-helper", default=os.path.expanduser("~/.grok/bin/openrouter-token"))
+    parser.add_argument("--compact-chars", type=int, default=120000, help="history budget before old tool results are compacted")
     parser.add_argument("--text-fallback", action="store_true", help="last resort: parse tool JSON from text (counted)")
     parser.add_argument("--openai-base", default=None, help="default: OpenRouter v1 for openrouter, http://127.0.0.1:11434 for ollama")
     parser.add_argument("--max-tokens-per-turn", type=int, default=2048)
@@ -471,18 +476,53 @@ def parse_pytest_summary(text):
     return found
 
 
+PASS_STATUSES = ("PASSED", "XFAIL")
+INVALID_ID = "IGNORED_INVALID_ID"
+
+
+def _prefix_hit(key, test_id):
+    """SWE-bench ids are cut at the first whitespace. A cut inside a parametrization
+    ('...[a-b' ) may match any continuation; otherwise the continuation must start a
+    parametrization ('[') so test_x never matches test_x_attrs."""
+    if not key.startswith(test_id) or key == test_id:
+        return False
+    if "[" in test_id:
+        return True
+    return key[len(test_id)] == "["
+
+
 def map_ids(ids, found):
+    """Exact id first, then bounded prefix match (see _prefix_hit). The group status is the
+    worst member: any non-pass wins, else XFAIL if any member xfailed, else PASSED.
+    Ids without '::' (e.g. '[100%]') are dataset artifacts: IGNORED_INVALID_ID."""
     mapped = {}
     for test_id in ids:
-        mapped[test_id] = found.get(test_id, "MISSING")
+        if test_id in found:
+            mapped[test_id] = found[test_id]
+            continue
+        if "::" not in test_id:
+            mapped[test_id] = INVALID_ID
+            continue
+        hits = [status for key, status in found.items() if _prefix_hit(key, test_id)]
+        if not hits:
+            mapped[test_id] = "MISSING"
+            continue
+        bad = [h for h in hits if h not in PASS_STATUSES]
+        mapped[test_id] = bad[0] if bad else ("XFAIL" if "XFAIL" in hits else "PASSED")
     return mapped
 
 
 def all_passed(f2p, p2p):
-    for mapping in (f2p, p2p):
-        for status in mapping.values():
-            if status != "PASSED":
-                return False
+    """FAIL_TO_PASS must be PASSED (no XFAIL, no ignored ids). PASS_TO_PASS accepts
+    PASSED, XFAIL, or an ignored dataset artifact id."""
+    if not f2p:
+        return False
+    for status in f2p.values():
+        if status != "PASSED":
+            return False
+    for status in p2p.values():
+        if status not in PASS_STATUSES and status != INVALID_ID:
+            return False
     return True
 
 
@@ -709,7 +749,13 @@ def apply_file(container, patch_path, log_path, label):
 
 
 def pytest_script(ids):
-    quoted = " ".join(shlex.quote(item) for item in ids)
+    # Run whole test files (SWE-bench style); results are mapped back to ids from -rA lines.
+    files = []
+    for item in ids:
+        path = item.split("::", 1)[0].strip()
+        if path.endswith(".py") and path not in files:
+            files.append(path)
+    quoted = " ".join(shlex.quote(item) for item in files)
     return (
         "source /opt/miniconda3/etc/profile.d/conda.sh && "
         "conda activate testbed && "
