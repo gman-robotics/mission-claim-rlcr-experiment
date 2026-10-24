@@ -44,6 +44,19 @@ DISALLOWED_TOOLS = (
     "Agent",
     "Skill",
     "TodoWrite",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "DesignSync",
+    "EnterWorktree",
+    "ExitWorktree",
+    "ListAgents",
+    "PushNotification",
+    "RemoteTrigger",
+    "ReportFindings",
+    "ScheduleWakeup",
+    "SendMessage",
+    "TaskStop",
 )
 
 
