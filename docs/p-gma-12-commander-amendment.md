@@ -9,6 +9,7 @@
 > - In section 2: the `post_message` and handoff details of the turn contract, and the board-message rule.
 > - Units 3, 4 and 5 (tool lists) and unit 7 in section 3.
 > - The "2 squads" lines in sections 4 and 5.
+>- In section 2: the turn-contract sentence that the shared client serves "both team squads" (it serves the Commander and all N squads), and the peer-verification sentence that the reviewer is "the other laguna squad" (it is a different squad, chosen per A1-2).
 > - Open question 7.
 >
 > The architecture plan carries inline A1 notes at each of those places. Everything else stays in force.
@@ -54,7 +55,7 @@ Squads keep the work tools and add the board tools `bid`, `report` and `ask_comm
 - In B, the nested sub-episodes break the one-awake-slot rule's simple timing logs.
 - A keeps the board as the single source of truth, keeps each agent's history small, and reuses park/wake unchanged. The cost of A is one more message vocabulary in the prompt.
 
-**Synthesis decision: A, plus one idea from B.** The squad's `finish` posts a short structured `WorkDone` summary to the Commander (B's good idea: the Commander does not need to read transcripts). The full detail stays on the board for audit. Squads stay role-neutral (architecture plan open question 9), so roles emerge from bids, not from prompts. Interface depth: the orchestrator public surface stays `run_team(session, runtime, cfg, instance) -> TeamOutcome` (architecture plan section 2), and the Commander is one more `AgentSlot` with a different tool list.
+**Synthesis decision: A, plus one idea from B.** The sketch below replaces candidate A's draft tool list (no `accept_bid`; adds `claim`, `answer`, `verify` and `finish`). The squad's `finish` posts a short structured `WorkDone` summary to the Commander (B's good idea: the Commander does not need to read transcripts). The full detail stays on the board for audit. Squads stay role-neutral (architecture plan open question 9), so roles emerge from bids, not from prompts. Interface depth: the orchestrator public surface stays `run_team(session, runtime, cfg, instance) -> TeamOutcome` (architecture plan section 2), and the Commander is one more `AgentSlot` with a different tool list.
 
 **Sketch (pseudocode, replaces the code-Commander parts of architecture plan section 2):**
 ```python
@@ -79,7 +80,7 @@ def run_team(session, runtime, cfg, instance) -> TeamOutcome:
     cmdr = AgentSlot("commander", COMMANDER_PROMPT, tools=COMMANDER_TOOLS)
     squads = [AgentSlot(f"squad-{i}", SQUAD_PROMPT, tools=SQUAD_TOOLS) for i in range(cfg.squads)]
     wake(cmdr, render(board, instance))                      # phase INTENT
-    while not closed and not guard_hit():
+    while not closed and not episode_guard_hit():   # Commander turn guard, all squads at turn guard, or wall clock
         slot = next_slot(board)                              # deterministic, one awake slot
         step(slot)                                           # board tools validated by parse()
         park(slot)
@@ -88,14 +89,14 @@ def run_team(session, runtime, cfg, instance) -> TeamOutcome:
 
 ## 2. Commander role and prompt contract
 
-**Role.** The Commander turns the problem into one or more `MissionIntent`s, chooses which squad does what, reads `WorkDone` and `PeerVerification` messages, and decides when the mission is done. It does not read code, edit code or run tests. It works only through board tools. Leadership Capital (architecture plan section 1) stays, as a **proposed** schedule (open question 10 stays open): a starting balance of 10, 1 unit per `reassign` or claim-conflict arbitration, allowed only while the balance is above 5. It is logged and never enters `reward`.
+**Role.** The Commander turns the problem into one or more `MissionIntent`s, chooses which squad does what, reads `WorkDone` and `PeerVerification` messages, and decides when the mission is done. It does not read code, edit code or run tests. It works only through board tools. Leadership Capital (architecture plan section 1) stays, as a **proposed** schedule (open question 10 stays open): a starting balance of 10, 1 unit per claim-conflict arbitration and (new in A1, proposed) 1 unit per `reassign`, allowed only while the balance is above 5. It is logged and never enters `reward`.
 
 **Prompt contract (the system prompt must state each item; a golden test checks the prompt for these clauses):**
 1. Identity: "You are the Strategic Commander of a team of N squads on the same model. You coordinate; you never edit code."
 2. Inputs it gets on each wake: the problem statement (first wake only), board entries since its last turn, the Leadership Capital balance, and a per-squad status line (turns used and last outcome).
 3. Allowed actions are the Commander tools only. It must make exactly one tool call per turn. A free-text reply gets a fail-closed error and counts as a turn.
-4. Assignment rule: assign each `MissionIntent` to the squad whose bid best matches. **Rework vs. reassign (one rule, shared with item 6):** after a failed `WorkDone` or a `Fail` peer verdict, send it back to the same squad once with the reviewer's notes. On the second failure for the same intent, or on any `WorkDone` with `repeat_failure: true`, use `reassign` to a different squad or narrow the intent with a new `broadcast_intent`. Never repeat the same assignment unchanged.
-5. Done rule: call `close_mission` only after a successful `WorkDone` (test-gated `finish` accepted) **and** a `Pass` `PeerVerification` from a different squad, followed by that squad's `OwnershipReport`. The orchestrator enforces this: it rejects `close_mission` otherwise. The harness still decides the result from the SWE eval (anchor). `close_mission` never sets `Pass` by itself (I-Peer-Non-Terminal, anchors:112).
+4. Assignment rule: assign each `MissionIntent` to the squad whose bid best matches. **Rework vs. reassign (one rule, shared with item 6):** after a failed `WorkDone` without `repeat_failure`, or after a `Fail` peer verdict, send it back to the same squad once with the reviewer's notes. On the second failure for the same intent, or on any `WorkDone` with `repeat_failure: true`, use `reassign` to a different squad or narrow the intent with a new `broadcast_intent`. Never repeat the same assignment unchanged.
+5. Done rule: call `close_mission` only after a successful `WorkDone` (test-gated `finish` accepted), then a `Pass` `PeerVerification` from a different squad (the reviewer), then the working squad's `OwnershipReport`. The orchestrator enforces this: it rejects `close_mission` otherwise. The harness still decides the result from the SWE eval (anchor). `close_mission` never sets `Pass` by itself (I-Peer-Non-Terminal, anchors:112).
 6. Loop rule: the harness sets `repeat_failure: true` when a squad makes the same failing tool call 3 times (same tool and arguments, for example the same non-unique `edit_file`, section 7). That ends the squad's assignment. The Commander then applies item 4.
 7. Brevity: every intent is self-contained (files, goal, verification), with a limit of 1500 characters.
 
@@ -105,7 +106,7 @@ def run_team(session, runtime, cfg, instance) -> TeamOutcome:
 
 ## 3. Tools and messages between the Commander and squads; assignment and hand-back
 
-All messages go through the board as structured tool calls validated by `parse` (architecture plan section 2: "the only door in"). The message types are the ones already planned (`MissionIntent`, `Bid`, `Claim`, `PeerVerification`, `OwnershipReport`, `Envelope`), plus three new ones:
+All messages go through the board as structured tool calls validated by `parse` (architecture plan section 2: "the only door in"). The message types are the ones already planned (`MissionIntent`, `Bid`, `Claim`, `PeerVerification`, `OwnershipReport`, `Envelope`), plus six new ones:
 - `Assignment(mission_id, squad_id, notes)`: the Commander's acceptance of a bid. It replaces the code-side `BidAccepted`.
 - `WorkDone(mission_id, squad_id, status, files, tests_run, evidence_ref, repeat_failure)`: posted by the harness when a squad's `finish` is accepted or rejected for the last time, or when `repeat_failure` ends the assignment.
 - `ReviewRequest(mission_id, reviewer_squad)`: posted by `request_review`.
@@ -121,11 +122,13 @@ All messages go through the board as structured tool calls validated by `parse` 
 | `finish(summary)` | squad | `WorkDone` (test-gated, as in `Episode`) | Commander |
 | `report(mission_id, verdict, evidence, corrective_actions)` | squad, after a `Pass` peer verdict | `OwnershipReport` (planned fields, architecture plan section 2) | Commander |
 | `request_review(mission_id, reviewer_squad)` | Commander | `ReviewRequest` | reviewer squad (fresh `history_id`, reviewer prompt) |
-| `verify(mission_id, verdict, disagreements, evidence_ref)` | squad | `PeerVerification` | Commander |
+| `verify(mission_id, verdict, disagreements, evidence)` | reviewer squad | `PeerVerification` (planned fields; the harness fills `reviewer_squad` from the caller, and `evidence` must cite an `exec.jsonl` seq or the patch hash) | Commander |
 | `ask_commander(mission_id, text)` | squad | `Question` | Commander |
 | `answer(mission_id, squad_id, text)` | Commander | `Answer` | the asking squad |
 | `reassign(mission_id, from_squad, to_squad, notes)` | Commander | `Assignment` (costs 1 capital) | new squad |
 | `close_mission(reason)` | Commander | `Close` | nobody; episode ends, eval runs |
+
+**Who wakes next (this table and the Scheduling rule agree):** `bid` wakes the next squad that has not bid yet, and wakes the Commander after the last bid or pass. `claim` keeps the claiming squad awake, so it starts work in the same wake. Every other squad message wakes the Commander, and every Commander message wakes the squad it names.
 
 **Assignment flow.** The steps run in this order, which matches plan:13 ("Specialists bid and claim. Peer verification happens before OwnershipReports go up"):
 1. INTENT: the Commander calls `broadcast_intent`.
@@ -141,7 +144,7 @@ A `claim` by a squad that was not assigned is a claim conflict. The orchestrator
 
 **Hand-back.** A squad never hands work directly to another squad. The PR #6 `handoff` tool is removed in this layout. All hand-backs go squad → board → Commander. This puts every coordination decision on the board, where it can be logged.
 
-**Scheduling.** The orchestrator wakes exactly one slot at a time, chosen by the board state (deterministic: the Commander after any squad message, the named squad after any Commander message, bids in squad order). This is the architecture plan's sequential turn contract, unchanged.
+**Scheduling.** The orchestrator wakes exactly one slot at a time. The choice is deterministic and follows the "Who wakes next" rule above: bids go in squad order, `claim` continues the same squad, any other squad message wakes the Commander, and any Commander message wakes the named squad. This is the architecture plan's sequential turn contract, unchanged.
 
 ## 4. Squad count 2 to 4, and how it is chosen
 
@@ -214,7 +217,7 @@ The three-arm eval (GMA-394) does not start until the model Commander lands. Tha
 ```
 team2 runs 30 agent sets {('editor', 'investigator'): 30} pooled turn limit {200} commander key present False board key False cost 1.3132
 ```
-So every PR #6 result is the fixed 2-role layout with a pooled 200-turn guard, and none has a Commander or board key. Nothing will be confused for, or mixed into, arm 1 data as long as the summarizer keeps filtering on `layout == "team2"`. The future layout name must be different (proposed: `mca`). A `grep -rn -i commander harness docs` finds the word only in the three plan docs: the source plan (`docs/mission-claim-rlcr-experiment-plan.md:13,29`), the architecture plan, and this amendment. It finds nothing in `harness/`.
+So every PR #6 result is the fixed 2-role layout with a pooled 200-turn guard, and none has a Commander or board key. Nothing will be confused for, or mixed into, arm 1 data as long as the summarizer keeps filtering on `layout == "team2"`. The future layout name must be different (proposed: `mca`). A `grep -rn -i commander harness docs` finds the word only in docs: the source plan (`docs/mission-claim-rlcr-experiment-plan.md:13,29`), the architecture plan, this amendment, and the relabel note added to `docs/results/gma-393-team-run.md` in this PR. It finds nothing in `harness/`.
 
 **Risks**
 1. **Guard semantics change (medium likelihood, medium cost).** `lesser_driver.py:844` pools turns, and `turn_limit_pooled` is in PR #6's `result.json`. A summarizer that compares `guard_stop` across layouts would compare unlike things. Check: the new layout writes `guards.max_turns_per_agent`, and the summarizer refuses to mix layouts.
@@ -235,4 +238,4 @@ So every PR #6 result is the fixed 2-role layout with a pooled 200-turn guard, a
 
 - A1-1: Should the Commander see squad transcripts on demand (a `read_report_detail` tool), or only structured reports? Default: structured reports only.
 - A1-2: Should verification always use a different squad when N ≥ 3, or the least-busy squad? Default: the next squad in order that did not do the work.
-- A1-3: Is a team-level wall clock separate from the per-agent 14400 s needed? Default: no. The per-agent clock starts at episode start, so it is already the team clock.
+- A1-3: Is a separate per-squad wall clock needed? Default: no. The 14400 s guard is one episode wall clock for all agents (section 5).
