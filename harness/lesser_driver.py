@@ -190,7 +190,9 @@ class Client:
         try:
             r = _post(self.base + "/chat/completions", payload, headers, timeout)
         except LLMError as exc:
-            if self.tool_choice == "required" and str(exc).startswith("HTTP 400") and "tool_choice" in str(exc):
+            msg_400 = str(exc)
+            if (self.tool_choice == "required" and msg_400.startswith("HTTP 400")
+                    and re.search(r"tool_choice[^\n]{0,80}(not supported|unsupported|invalid|must be)", msg_400, re.I)):
                 self.tool_choice = "auto"
                 self.requests += 1
                 payload["tool_choice"] = "auto"
@@ -295,7 +297,7 @@ class Episode:
         last = summary[-1] if summary else ""
         ok = (rc == 0 and bool(re.search(r"\b\d+ passed\b", last))
               and not re.search(r"\b\d+ (failed|errors?)\b", last))
-        return ok, "pytest rc=%s\n%s" % (rc, clip(out, 6000))
+        return ok, "pytest rc=%s\n%s\nstderr:\n%s" % (rc, clip(out, 6000), clip(err, 2000))
 
     def call(self, name, raw_args):
         """Return tool result text. Errors are returned to the model (fail closed), never executed."""
@@ -332,10 +334,21 @@ class Episode:
             if rc != 0:
                 return "ERROR: cannot read %s: %s" % (p, err.strip()[:500])
             lines = out.splitlines()
-            s = max(1, int(args.get("start_line") or 1)) if str(args.get("start_line") or "1").isdigit() else 1
-            e = int(args.get("end_line")) if str(args.get("end_line") or "").isdigit() else min(len(lines), s + 399)
-            if e < s and lines:
+            def as_int(v, default):
+                if isinstance(v, bool):
+                    return default
+                if isinstance(v, int):
+                    return v
+                if isinstance(v, str) and v.strip().isdigit():
+                    return int(v)
+                return default
+            s = max(1, as_int(args.get("start_line"), 1))
+            e = as_int(args.get("end_line"), None)
+            e = min(len(lines), s + 399) if e is None or e == 0 else e
+            if e < s:
                 return "ERROR: end_line must be >= start_line"
+            if lines and s > len(lines):
+                return "ERROR: start_line %d is past the end of the file (%d lines)" % (s, len(lines))
             self.read_paths.add(p)
             body = "\n".join("%6d  %s" % (i, lines[i - 1]) for i in range(s, min(e, len(lines)) + 1))
             return "%s (%d lines total, showing %d-%d)\n%s" % (p, len(lines), s, min(e, len(lines)), clip(body, 24000))
