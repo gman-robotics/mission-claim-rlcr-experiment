@@ -293,7 +293,8 @@ def load_instance(path):
         log("abort: instance JSON must be an object")
         raise SystemExit(2)
     instance_id = data.get("instance_id")
-    if instance_id not in ALLOWED_INSTANCES:
+    stem = os.path.basename(path)[:-5] if path.endswith(".json") else None
+    if instance_id not in ALLOWED_INSTANCES or stem != instance_id:
         log("abort: unexpected or missing instance_id: %r" % instance_id)
         raise SystemExit(2)
     commit = data.get("base_commit")
@@ -479,10 +480,21 @@ PASS_STATUSES = ("PASSED", "XFAIL")
 INVALID_ID = "IGNORED_INVALID_ID"
 
 
+def _prefix_hit(key, test_id):
+    """SWE-bench ids are cut at the first whitespace. A cut inside a parametrization
+    ('...[a-b' ) may match any continuation; otherwise the continuation must start a
+    parametrization ('[') so test_x never matches test_x_attrs."""
+    if not key.startswith(test_id) or key == test_id:
+        return False
+    if "[" in test_id:
+        return True
+    return key[len(test_id)] == "["
+
+
 def map_ids(ids, found):
-    """Exact id first. SWE-bench ids are cut at whitespace, so fall back to prefix match:
-    PASSED only if every prefixed result passes. Ids without '::' (e.g. '[100%]') are
-    dataset artifacts: recorded as IGNORED_INVALID_ID and not counted."""
+    """Exact id first, then bounded prefix match (see _prefix_hit). The group status is the
+    worst member: any non-pass wins, else XFAIL if any member xfailed, else PASSED.
+    Ids without '::' (e.g. '[100%]') are dataset artifacts: IGNORED_INVALID_ID."""
     mapped = {}
     for test_id in ids:
         if test_id in found:
@@ -491,20 +503,26 @@ def map_ids(ids, found):
         if "::" not in test_id:
             mapped[test_id] = INVALID_ID
             continue
-        hits = [status for key, status in found.items() if key.startswith(test_id)]
+        hits = [status for key, status in found.items() if _prefix_hit(key, test_id)]
         if not hits:
             mapped[test_id] = "MISSING"
-        else:
-            bad = [h for h in hits if h not in PASS_STATUSES]
-            mapped[test_id] = bad[0] if bad else "PASSED"
+            continue
+        bad = [h for h in hits if h not in PASS_STATUSES]
+        mapped[test_id] = bad[0] if bad else ("XFAIL" if "XFAIL" in hits else "PASSED")
     return mapped
 
 
 def all_passed(f2p, p2p):
-    for mapping in (f2p, p2p):
-        for status in mapping.values():
-            if status not in PASS_STATUSES and status != INVALID_ID:
-                return False
+    """FAIL_TO_PASS must be PASSED (no XFAIL, no ignored ids). PASS_TO_PASS accepts
+    PASSED, XFAIL, or an ignored dataset artifact id."""
+    if not f2p:
+        return False
+    for status in f2p.values():
+        if status != "PASSED":
+            return False
+    for status in p2p.values():
+        if status not in PASS_STATUSES and status != INVALID_ID:
+            return False
     return True
 
 

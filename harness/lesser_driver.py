@@ -55,38 +55,44 @@ WRITE_PATTERNS = [
     (r"\bsed\b[^|;&]*\s-[a-zA-Z]*i", "sed -i"),
     (r"\bperl\b[^|;&]*\s-[a-zA-Z]*i", "perl -i"),
     (r"\btee\b", "tee"),
-    (r"\b(mv|cp|rm|install|truncate|dd|ln|touch|chmod)\b", "file mutation command"),
-    (r"\bgit\s+(apply|am|checkout|restore|reset|stash|clean|commit|rm|mv)\b", "git write"),
-    (r"(^|[;&|\s])patch\b", "patch"),
-    (r"open\([^)]*,\s*['\"][wax+]", "python file write"),
-    (r"\.write_(text|bytes)\(", "python file write"),
-    (r"\b(shutil|os)\.(copy|move|remove|unlink|rename|replace)", "python file mutation"),
+    (r"\b(mv|cp|rm|install|truncate|dd|ln|touch|chmod|chown|mkdir|rmdir)\b", "file mutation command"),
+    (r"\bgit\b(\s+(-c|-C)\s+\S+|\s+--\S+)*\s+(apply|am|checkout|switch|restore|reset|stash|clean|commit|rm|mv|merge|rebase|cherry-pick)\b", "git write"),
+    (r"(^|[;&|\s/])patch\b", "patch"),
+    (r"open\([^)]*,\s*(mode\s*=\s*)?['\"][^'\"]*[wax+]", "python file write"),
+    (r"\.write_(text|bytes)\(|\.(write|writelines)\(", "python file write"),
+    (r"\b(shutil|os|pathlib|Path)\b[.\w]*\.(copy\w*|move|remove|unlink|rename|replace|rmtree|makedirs|mkdir|symlink|chmod|truncate|touch)\b", "python file mutation"),
 ]
-_SAFE_REDIRECT = re.compile(r"\d?>>?\s*(/dev/null|/tmp/\S*)|\d?>&\d|&>\s*/dev/null")
+# /tmp scratch writes are allowed, but not paths that climb out of /tmp.
+_SAFE_REDIRECT = re.compile(r"\d?>>?\s*(/dev/null\b|/tmp/(?![^\s;&|]*\.\.)[^\s;&|]*)|\d?>&\d|&>\s*/dev/null\b")
 
 
 def write_violation(command):
-    """Return a reason if a run command looks like it writes files (edits must go through edit_file)."""
+    """Return a reason if a run command looks like it writes files (edits must go through edit_file).
+    Mutation patterns are matched on the raw command, quotes included, so `python -c '...shutil.copy...'`
+    and `os.system("cp ...")` are caught. Redirects are matched with quoted text removed so
+    `python -c "print(1 > 0)"` is allowed. Fail closed: a false positive only costs the model a rephrase."""
+    for pat, why in WRITE_PATTERNS:
+        if re.search(pat, command):
+            return why
     stripped = _SAFE_REDIRECT.sub(" ", command)
-    stripped = re.sub(r"'[^']*'|\"[^\"]*\"", lambda m: m.group(0) if re.search(r"open\(|write_", m.group(0)) else "''", stripped)
+    stripped = re.sub(r"'[^']*'|\"[^\"]*\"", "''", stripped)
     if re.search(r"(?<![<>=!-])>>?(?!=)", stripped):
         return "output redirect to a file"
-    for pat, why in WRITE_PATTERNS:
-        if re.search(pat, stripped):
-            return why
     return None
 
 
 def compact(messages, budget_chars, keep_tail=8):
     """Shrink old tool results (never the system/task prompt or the last keep_tail messages).
     Tool-call/result pairing is preserved; only content is replaced. Returns chars saved."""
-    total = sum(len(m.get("content") or "") for m in messages)
+    def size(m):
+        return len(m.get("content") or "") + sum(len(json.dumps(c)) for c in (m.get("tool_calls") or []))
+    total = sum(size(m) for m in messages)
     if total <= budget_chars:
         return 0
     saved = 0
     for m in messages[2:max(2, len(messages) - keep_tail)]:
         c = m.get("content") or ""
-        if m.get("role") == "tool" and len(c) > 400 and not c.startswith("[compacted"):
+        if m.get("role") == "tool" and len(c) > 200 and not c.startswith("[compacted"):
             first = c.splitlines()[0][:160] if c else ""
             m["content"] = "[compacted %d chars] %s" % (len(c), first)
             saved += len(c) - len(m["content"])
@@ -334,6 +340,9 @@ class Episode:
             if rc != 0:
                 return "ERROR: cannot read %s: %s" % (p, err.strip()[:500])
             lines = out.splitlines()
+            if not lines:
+                self.read_paths.add(p)
+                return "%s (empty file)" % p
             def as_int(v, default):
                 if isinstance(v, bool):
                     return default
