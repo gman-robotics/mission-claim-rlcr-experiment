@@ -3,6 +3,8 @@
 > Plan-only. Produced 2026-10-23 by headless Claude Code with pstack /poteto-mode, /architect, /interrogate, /blast-radius, /show-me-your-work (session 58c097a3-6d1b-4d3a-83e9-b3f3acf4e5dd). No implementation. Mirrors the Linear doc on project P-GMA-12.
 >
 > Revision 2 (2026-10-24, Bo - Bench Eng, no Claude used): folds in Tom's answers to Q1-Q3 and fixes the three round-1 review blockers. Tom's answers: **Q1** no budget or runtime cap; **Q2** the lesser model is paid `poolside/laguna-s-2.1` (OpenRouter) for the MCA team (2 agents) and the single lesser arm; **Q3** grok-4.7 is both the judge and the frontier control. No Claude anywhere in the experiment.
+>
+> Revision 3 (2026-10-24, Bo - Bench Eng, Tom-approved final review round): removes every turn and wall-clock cap, makes the turn contract one rule that matches the merged harness, and refreshes harness cites against origin/main 88641058.
 
 Scope is GMA-393 (MCA command layer on the same SWE session), GMA-394 (three-arm run on a small task set) and GMA-395 (collective-advantage RLCR loop). Nothing is built yet.
 
@@ -29,9 +31,9 @@ The `agent-swarm` and `agent-council` repos are Rust. I saw file lists only and 
 
 | Q | Answer | Tag |
 |---|---|---|
-| Q1 budget | **Tom: no budget or runtime cap** (no spend cap, no wall-clock cap for the study). Parity still holds: arms 1 and 2 get "the same token or wall-clock budget" (plan:15), so each arm gets the same pooled limit of 60 model turns per task (team: pooled across its 2 agents; single: one agent). The limit is a parity control, not a cost cap. Wall-clock, tokens and `cost_usd` are recorded in every `result.json`, never enforced. | Tom decision + plan rule |
+| Q1 budget | **Tom: no budget or runtime cap** for P-GMA-12 on paid laguna: no spend cap, no turn cap and no wall-clock cap. Parity with plan:15 ("the same token or wall-clock budget") holds because every arm runs under the same uncapped condition. The harness hang guards on main (`--max-turns`, `--agent-timeout`, `run_single_agent.py:326-348`) are set to the same value in every arm, are recorded in `result.json`, and a run that hits one is logged as a guard stop, not treated as a budget. Wall-clock, tokens and `cost_usd` are recorded in every `result.json`, never enforced. | Tom decision + plan rule |
 | Q2 reuse and lesser model | **Tom: lesser model = paid `poolside/laguna-s-2.1`** via OpenRouter's OpenAI-compatible API, one shared client for the team and the same model for arm 2. Reuse: the plan says "reuse the MCA PoC scaffolding where it exists" (plan:29). The PoC's `command/`, `squad/` and `protocol/` are empty (poc:136-141). What exists is the Rust message vocabulary (protocol-messages:27-142), the anchored evidence types (protocol-messages:152-184), and the GMA-393 driver (`harness/lesser_driver.py`). The message vocabulary and the full anchored evidence shape are ported to Python dataclasses (section 2). | Tom decision + plan rule |
-| Q3 messages and board | The plan names the messages and "one message board" (plan:13). Field shapes come from the wiki, not the plan. Board default is an append-only JSONL file on the host, owned by the orchestrator. `Claim` is new, since the wiki has `SquadBid` plus a `BidAccepted` event but no `Claim` type. `Bid` keeps only a subset of `SquadBid`, and `MissionIntent` uses `wall_budget_sec` instead of `token_budget`; both are proposed simplifications, not wiki shapes. | plan names, proposed default |
+| Q3 messages and board | The plan names the messages and "one message board" (plan:13). Field shapes come from the wiki, not the plan. Board default is an append-only JSONL file on the host, owned by the orchestrator. `Claim` is new, since the wiki has `SquadBid` plus a `BidAccepted` event but no `Claim` type. `Bid` keeps only a subset of `SquadBid`, and `MissionIntent` drops the wiki's `token_budget` ceiling (protocol-messages:35) because Q1 has no cap; both are proposed simplifications, not wiki shapes. | plan names, proposed default |
 | Q4 team | The plan gives one Strategic Commander plus "two to four" squads, all on the same lesser model (plan:13). **Tom: start with 2 agents.** So the team is 2 laguna squads, one agent each, sequential turns. The Strategic Commander is deterministic orchestrator code (intent broadcast, bid acceptance, claim arbitration), not a model agent; this is a deviation from plan:13 forced by the 2-agent limit and is logged. Squads are role-neutral. They share one base prompt and differ only in `squad_id`. Roles are read off their bids, not assigned (open question 9). An idle squad is parked (no model calls) until the orchestrator wakes it (`AgentSlot`, PR #4). | Tom decision + plan range |
 | Q5 done | Study level (plan:41):<br>• The team beats the single lesser agent.<br>• After training the gap grows or closes on the frontier control.<br>• Role emergence, peer-review frequency and Leadership Capital usage are logged.<br>Per ticket (proposed; this is the single definition, section 3 refers back to it):<br>• **GMA-393 is done** when unit 4 passes (scripted protocol check) **and** unit 7 runs: one real-model MCA run on `pallets__flask-5014` that ends with `board.jsonl`, `result.json`, an eval and `containers_removed: true`. Resolving in unit 7 is not required.<br>• GMA-394 is done when N tasks × 3 arms × K repeats have result records and blind judge notes.<br>• GMA-395 is done only after the gate in section 7. | plan study level, proposed per ticket |
 
@@ -93,7 +95,7 @@ Evidence(kind, anchor_id: Optional[str], artifact_ref, observed_at, observer, pa
                                                           # artifact_ref: exec.jsonl seq, patch hash or run_id; never prose alone
 AnchorSpec(anchor_id, family, check, required, freshness) # v1: one required anchor, family=Observational, check=TestSuite (SWE eval)
 AnchorResult(anchor_id, status, evidence, runner_id)      # status: Satisfied | Failed | Unavailable | Expired
-MissionIntent(mission_id, parent_id, objective, end_state, constraints, isolation=False, wall_budget_sec)
+MissionIntent(mission_id, parent_id, objective, end_state, constraints, isolation=False)   # no budget field (Q1)
 Bid(mission_id, squad_id, confidence, estimated_turns, rationale)
 Claim(mission_id, squad_id, snapshot_ref)                 # snapshot_ref is a git diff hash
 PeerVerification(mission_id, reviewer_squad, verdict, disagreements, evidence)
@@ -110,21 +112,20 @@ Phase = INTENT -> BIDDING -> CLAIMED -> WORKING -> VERIFYING -> REPORTING -> DON
 def run_team(session, runtime, cfg: TeamConfig, instance) -> TeamOutcome: ...
 # arms.py, judge.py, results.py
 class Arm(Enum): MCA; SINGLE; FRONTIER
-def run_arm(arm, instance, runtimes, budget, logs_root) -> ArmResult: ...
+def run_arm(arm, instance, runtimes, logs_root) -> ArmResult: ...
 def blind_packet(results) -> list[BlindEntry]: ...        # shuffled, opaque ids, model names scrubbed
 def judge(entries, runtime) -> list[JudgeNotes]: ...
 ArmResult(schema_version, instance_id, arm, model_requested, model_reported, runtime_name, credit_source,
-          status, reward: int, f2p, p2p, timings, turns, exec_calls, tokens, run_dir,
+          status, reward: int, f2p, p2p, timings, turns, exec_calls, tokens, cost_usd: float, run_dir,
           containers_removed, diagnostics: dict)
 ```
 
 **Design choices.**
-- **Messages are agent outputs.** Each turn is a fresh invocation. Its final text is one JSON message, which the orchestrator parses, validates and appends. The alternative is a board MCP tool per agent. I rejected it because sequential turns give it nothing to coordinate over, and it adds a subprocess and IPC.
-- **Malformed output.** Board messages are emitted through a structured tool call (`post_message`), validated by `parse`. A bad call gets an error back (fail closed, as in PR #4) and counts as a turn. Two consecutive failures end the turn as `parse_failed` and are logged.
-- **Agent state (one rule for all arms).** Every worker agent keeps one continuous message history per episode inside `ApiRuntime`, with old tool results compacted when the history is long. That holds for each team squad and for the arm 2 single agent and the arm 3 control, so there is no fresh-turn versus continuous-session confound. Nothing runs through `claude -p` (section 5). The only fresh-context turn is peer verification, by design (I-Fresh-Checker, anchors:118).
+- **Turn contract (one rule for all arms, matching `harness/lesser_driver.py` on main).** One shared OpenRouter `Client` (`lesser_driver.py:140`) serves both team squads; the model is loaded once and no agent gets its own client. Each worker agent is an `AgentSlot` (`:403-416`) with one continuous message history per episode, compacted when long (`compact`, `:84`; called in `step`, `:424`). The orchestrator wakes a slot with an explicit handoff message (`wake`, `:411`): the board entries since that agent last acted, rendered by `Board.render`. The agent then works with structured tool calls (`step`, `:419`) and posts its board message through the `post_message` tool. After `post_message` or `finish` the slot parks (`park`, `:415`) and makes no model calls until the next handoff. Only one slot is awake at a time (sequential turns). Arm 2 and arm 3 use the same slot and history rule with one agent and no handoffs, so there is no fresh-turn versus continuous-history confound. Nothing runs through `claude -p` (section 5). The only fresh-context turn is peer verification, by design (I-Fresh-Checker, anchors:118): the reviewer gets a new `history_id`.
+- **Board messages are tool calls.** `post_message` arguments are validated by `parse`. A bad call gets an error back (fail closed, as in PR #4) and counts as a turn. Two consecutive failures end the turn as `parse_failed` and are logged. Free-text final answers are never parsed as board messages.
 - **`isolation` is forced false in v1.** All agents share one workspace and can read each other's edits through exec, so hiding board bodies would be cosmetic.
-- **Mount layout.** Only `run_dir/shared` is mounted at `/logs`. `board.jsonl`, `result.json` and `exec.jsonl` live in `run_dir/host`. Today the run dir is mounted read-write, so an agent can write the same dir that holds `exec.jsonl`, which `count_exec_calls` trusts (`run_single_agent.py:488-506`). The eval reads `/logs/model.filtered.patch` and `/logs/test.patch` and writes `/logs/pytest.txt` (`:700,726,728`). Those move into `shared`, and `session.py` owns that move.
-- **Container prefix.** Today's reap and the cleanup check use `name=gma392-` (`:637`, README:53), and Docker name filters match substrings. A new prefix would be invisible to them. `remove_names` takes the prefix as a parameter. New runs use `gma12-`. The reap docs list both prefixes.
+- **Mount layout.** Only `run_dir/shared` is mounted at `/logs`. `board.jsonl`, `result.json` and `exec.jsonl` live in `run_dir/host`. Today the run dir is mounted read-write, so an agent can write the same dir that holds `exec.jsonl`, which `count_exec_calls` trusts (`run_single_agent.py:547-566`). The eval reads `/logs/model.filtered.patch` and `/logs/test.patch` and writes `/logs/pytest.txt` (`:765,791,793`). Those move into `shared`, and `session.py` owns that move.
+- **Container prefix.** Today's reap and the cleanup check use `name=gma392-` (`:696`, README:53), and Docker name filters match substrings. A new prefix would be invisible to them. `remove_names` takes the prefix as a parameter. New runs use `gma12-`. The reap docs list both prefixes.
 - **Peer verification.** The wiki wants a *different* model or prompt to verify (command-and-flow:90) and a different model family for peer review (protocol-messages:127, rlcr-and-mission-claim:48). The plan puts all agents on the same lesser model (plan:13), and Tom kept that (Q2). So in v1 the reviewer is the other laguna squad with a different prompt and a fresh context that excludes the worker transcript (I-Fresh-Checker, anchors:118). This is a known deviation from the wiki, recorded in `diagnostics` and in open question 11, not a wiki rule.
 - **Terminal verdict.** A peer verdict is `PeerOpinion` evidence and never terminal (I-Peer-Non-Terminal, anchors:112; "peer alone cannot terminal-Pass", protocol-messages:184). `Pass` requires every required `AnchorSpec` to be `Satisfied` (protocol-messages:183-184). In this experiment the only required anchor is the SWE eval (`TestSuite`); that choice is a proposed default for this study, not a wiki statement. An `Unavailable` eval yields `BlockedOnAnchor`, never `Pass`.
 - **Rejection.** The default is one bounded redispatch with the reviewer's fixes attached. Automatic rollback to the pre-claim snapshot (command-and-flow:90) is deferred.
@@ -136,23 +137,23 @@ ArmResult(schema_version, instance_id, arm, model_requested, model_reported, run
 |---|---|---|
 | 0 | Pure extraction into `session.py`, with no behavior change. The prefix becomes a parameter. | `--mode gold` gives `resolved`, F2P 1/1 and P2P 59/59 (session:70). `result.json` keys match a saved old run. `docker ps -a --filter name=gma392-` is empty. |
 | 1 | Mount relocation to `run_dir/shared` | Gold is `resolved` again. `docker inspect` shows one bind whose source ends in `/shared`. `ls /logs` in the work container shows no `exec.jsonl`, no `result.json` and no board file. |
-| 2 | `protocol.py` and `board.py` | A round-trip test covers all five types. Malformed, unknown-field and missing-field input is rejected. Two processes appending concurrently yield strictly increasing `seq`. |
+| 2 | `protocol.py` and `board.py` | A round-trip test covers every ported type: the messages (`MissionIntent`, `Bid`, `Claim`, `PeerVerification`, `OwnershipReport`, `Envelope`) and the evidence types (`Evidence`, `AnchorSpec`, `AnchorResult`, `Verdict`). Malformed, unknown-field and missing-field input is rejected. Two processes appending concurrently yield strictly increasing `seq`. |
 | 3 | `runtime.py` with `ScriptedRuntime` and `ApiRuntime` (wraps `lesser_driver.py`) | A golden test asserts the exact tool list (`read_file`, `edit_file`, `run`, `finish`, plus `post_message` for team roles). A scripted agent applying the gold patch evaluates to `resolved`. A unit test shows the API key is read from the helper at runtime and never appears in any run-dir file. |
 | 4 | `orchestrator.py` and `capital.py`, scripted (plumbing precondition for GMA-393; see Q5 for "done") | The board shows intent, two bids, claim, work, peer verification, report. The scripted squad applies the gold patch, so the eval is `resolved`; this checks plumbing, not agent skill. A reject script exercises redispatch. A double-claim script exercises one arbitration (ledger balance 10 → 9). A malformed-output script hits the error and `parse_failed` paths. `docker ps` is clean afterward. |
 | 5 | `arms.py` and `results.py` | Scripted arms 1 and 2 write schema-valid records. Tool parity (plan:15): the tool list given to arm 2 and arm 3 equals the team's work tools, asserted by a golden test. The logged container names are distinct per arm. Arm 1 logs exactly one work container name. Arms run sequentially (start and end times do not overlap). |
 | 6 | `ApiRuntime` security check | An API-side canary asks the model to touch a host file and passes only if the file stays absent. A write-guard test shows `run` rejects file writes (redirects, `sed -i`, `mv`, `cp`, `tee`). |
 | 7 | One real-model MCA run on flask-5014 (2 laguna squads) | The Q5 GMA-393 definition: `board.jsonl`, `result.json` and the eval exist and `containers_removed` is true. Resolving is not required. |
 | 8 | `judge.py` (grok-4.7 via OpenRouter `x-ai/grok-4.7`) | Grep over the blind packet finds no arm or model strings. Sanity: the judge ranks a gold patch above an empty patch and a wrong patch. A guess-the-arm test compares the judge's guesses to chance. |
-| 9 | GMA-394 task loader (replaces `EXPECTED_INSTANCE`, `:20,280-282`) plus `instances/allowlist.json` | Gold gate runs 3 times per allowlisted instance before any agent spend. Tasks whose gold does not resolve all 3 times are dropped. (Units 0 and 1 run gold once as a regression check; the 3-times gate is only here.) |
+| 9 | GMA-394 task loader (extends the directory allowlist on main, `ALLOWED_INSTANCES`, `:20-23`, checked at `:297`) plus `instances/allowlist.json` | Gold gate runs 3 times per allowlisted instance before any agent spend. Tasks whose gold does not resolve all 3 times are dropped. (Units 0 and 1 run gold once as a regression check; the 3-times gate is only here.) |
 | 10 | GMA-394 matrix, N tasks × 3 arms × K repeats | One summary table of pass rates plus one record per cell. |
 | 11 | GMA-395 offline pieces, pure functions only: rollout export and advantage | Within an episode every token of every agent gets the same advantage (plan:37). For a GRPO-style group baseline, advantages sum to 0 across a group of rollouts; the CISPO variant is tested only if open question 15 picks it. Identical rewards give 0 advantage. No training happens here. |
 
 ## 4. Laptop limits and run-time estimates
 
-- **Containers.** `--platform linux/amd64`, `--network none`, `--memory 4g` (`run_single_agent.py:605-611`). Reported by Tom, not re-measured: the amd64 emulation cost.
-- **Concurrency.** The work box is removed before the eval box starts (`:947-950`), and arms run one at a time. Peak is one 4g container plus the Docker VM. The VM memory and CPU settings are unverified, because `docker info` needed approval.
+- **Containers.** `--platform linux/amd64`, `--network none`, `--memory 4g` (`run_single_agent.py:665-667`). Reported by Tom, not re-measured: the amd64 emulation cost.
+- **Concurrency.** The work box is removed before the eval box starts (`:1024-1028`), and arms run one at a time. Peak is one 4g container plus the Docker VM. The VM memory and CPU settings are unverified, because `docker info` needed approval.
 - **Disk.** The flask-5014 image is 4.23GB (`docker images`, observed). For N=5 this is about 21GB of image cache (inferred).
-- **Image pull.** The first pull per task has a 1800 s timeout (`:761`). Later runs hit the cache.
+- **Image pull.** The first pull per task has a 1800 s timeout (`:826`). Later runs hit the cache.
 
 | Unit | Estimate | Basis |
 |---|---|---|
@@ -164,7 +165,7 @@ ArmResult(schema_version, instance_id, arm, model_requested, model_reported, run
 ## 5. Cost and model routing
 
 Tom's answers remove the credit questions.
-- **No Claude anywhere** (Q3). No `claude -p`, no Claude judge, no Anthropic models. The GMA-392 Claude agent path in `run_single_agent.py` (`claude_argv`, `:538-561`) stays only as legacy code and is not used by any arm.
+- **No Claude anywhere** (Q3). No `claude -p`, no Claude judge, no Anthropic models. The GMA-392 Claude agent path in `run_single_agent.py` (`claude_argv`, `:597-620`) stays only as legacy code and is not used by any arm.
 - **Lesser model** (Q2): paid `poolside/laguna-s-2.1` on OpenRouter for arm 1 (2 squads, one shared client) and arm 2.
 - **Frontier control and judge** (Q3): grok-4.7, called as OpenRouter `x-ai/grok-4.7` (listed on 2026-10-24) through the same `ApiRuntime`. The judge runs blind (unit 8).
 - **Keys** come only from the existing `op read` helper (`openrouter-token`) at runtime, held in memory, never written to files or logs.
@@ -182,7 +183,7 @@ Units 0 to 5 need no model calls because `ScriptedRuntime` drives them.
 | `ApiRuntime` exposes more tools than intended | Unit 3 tool-list golden test and the unit 6 API canary. |
 | Agent writes files through `run`, skipping read-before-edit | Unit 6 write-guard test; blocked attempts are logged and counted. |
 | API key leaks into logs | Unit 3 key test: grep every run-dir file for the key prefix. |
-| Agent edits tests | `filter_patch` strips test hunks (`:400-415`). Assert the filtered patch is a subset of the raw one in every run. |
+| Agent edits tests | `filter_patch` strips test-file diffs (`filter_patch`, `:424-439`). Assert the filtered patch is a subset of the raw one in every run. |
 | Agents tamper with the audit log | Unit 1 check: `exec.jsonl` is not inside the mounted dir. |
 | Workspace clobbering in the shared container | Sequential turns. Assert one active runtime process at a time from logged start and end times. |
 | Model emits broken tool calls | Fail-closed errors are counted per episode (PR #4 smoke: 0 invalid of 86). Unit 4 malformed-output script. Report the `parse_failed` rate. |
@@ -212,18 +213,18 @@ Units 0 to 5 need no model calls because `ScriptedRuntime` drives them.
 
 ## 8. Questions the plan leaves open
 
-1. ~~Budget~~ — answered: no cap; equal pooled turn limits for parity only (Q1).
+1. ~~Budget~~ — answered: no budget or runtime cap; cost is recorded (Q1).
 2. ~~Lesser model and judge~~ — answered: laguna-s-2.1; grok-4.7 judges.
 3. ~~Frontier control~~ — answered: grok-4.7.
 4. What counts as a "small task set", and which images. The plan allows the OpenReward port or the official Docker images (plan:23). The GMA-393 baseline branch adds more SWE-bench Verified instances with official images.
 5. How many repeats K per cell.
 6. How "stable" is defined, and the statistical bar for "scores higher" (plan:41). N=5 cannot support significance.
 7. The squad count in 2 to 4.
-8. Concurrency. Sequential or parallel, and the shared-file rules if parallel.
+8. ~~Concurrency~~ — settled: sequential turns (Q4, section 2 turn contract). Parallel is out of scope for v1.
 9. Whether squads are role-neutral (default) or given hand-assigned roles. Assigned roles defeat the "role emergence" log (plan:41).
 10. Initial Leadership Capital and its cost schedule. The wiki gives only the example `>5` and `−1`.
-11. Peer reviewer diversity. All agents share one model (plan:13, Tom Q2), but the wiki wants a different model or prompt (command-and-flow:90) and a different model family for peer verify (protocol-messages:127, rlcr-and-mission-claim:48). v1 uses a different prompt and fresh context only. Should a later run add grok-4.7 or another family as reviewer, at the cost of breaking the same-model rule? (Agent state is settled: continuous per-agent history in every arm, section 2.)
-12. Rollback on rejection. Required or deferred.
+11. Peer reviewer diversity. All agents share one model (plan:13, Tom Q2), but the wiki wants a different model or prompt (command-and-flow:90) and a different model family for peer verify (protocol-messages:127, rlcr-and-mission-claim:48). v1 uses a different prompt and fresh context only. Should a later run add grok-4.7 or another family as reviewer, at the cost of breaking the same-model rule? (Agent state is settled: the section 2 turn contract.)
+12. ~~Rollback on rejection~~ — settled: deferred in v1 (section 2, Rejection).
 13. Whether arm 1 always logs only the collective outcome (plan:13), or only during the RLCR phase (AGENTS.md).
 14. A blind judge that must also assess coordination (plan:19). How to scrub transcripts.
 15. The RLCR substrate. Open-weights model (are laguna weights available?), trainer, token logprobs, and CISPO versus GRPO (plan:37). Whether GMA-395 is in scope for this laptop at all.
@@ -233,16 +234,17 @@ Units 0 to 5 need no model calls because `ScriptedRuntime` drives them.
 
 What changed from the first draft, and why.
 - **Timing labels.** The first draft called the 10 s and 20 s figures "measured". They came from Tom, not from `docs/gma-392-session.md`, so they are now "reported by Tom".
-- **Budget.** The first draft reused `--max-turns` as a team-wide cap. That flag counts turns inside one `claude -p` call. The plan now uses an orchestrator turn cap plus a pooled wall-clock cap.
-- **Estimates.** N=5 now includes K=3 repeats. The gold gate runs 3 times everywhere, not once in one place.
+- **Budget.** The first draft reused `--max-turns` as a team-wide cap. That flag counts turns inside one `claude -p` call. Revision 3 removes every cap: no turn pool and no wall-clock budget (Tom Q1). Only equal hang guards remain, recorded per run.
+- **Estimates.** N=5 now includes K=3 repeats. Units 0 and 1 run gold once as a regression check; the 3-times gold gate is only in unit 9.
 - **Mount.** The mount move is now its own unit with a gold check, and the eval-path files move with it. The first draft hid this inside a design note.
 - **Prefix.** Cleanup and reap matched only `gma392-`. The prefix is now a parameter, and the docs list both prefixes.
-- **Security.** The first draft had no check for the moved launcher. It now has an argv golden test, an optional canary rerun at gate 1, and a separate unit for `ApiRuntime` with its own tool-list test and canary.
-- **Missing unit.** `ApiRuntime` is on the critical path for any real run and was missing. It is now unit 6.
-- **Bad defaults.** Hard-prompted squad roles are now role-neutral squads. `isolation` is forced false. Fresh turns now carry the squad's own notes. The confound with arm 2 is recorded, not hidden.
+- **Security.** The first draft had no check for the moved launcher. It now has a unit 3 tool-list golden test and API key test, and a unit 6 security canary plus write-guard test.
+- **Missing unit.** `ApiRuntime` is on the critical path for any real run and was missing. It is now unit 3; unit 6 is its security canary.
+- **Bad defaults.** Hard-prompted squad roles are now role-neutral squads. `isolation` is forced false. Agent state follows the single section 2 turn contract (continuous per-agent history, handoff messages, parked idle agents), so there is no arm-2 confound.
 - **Malformed output.** Added a repair and `parse_failed` policy and a unit 4 test for it.
 - **Checks.** The mid-run `docker ps` check became logged container names. The judge check gained a guess-the-arm test. The stability bar now says N=5 is descriptive only.
-- **Credits.** Added the open-weights option and a gate for a one-time canary credit exception.
+- **Credits.** Superseded by Tom's Q1-Q3: no Claude anywhere, OpenRouter for all model calls, no canary credit exception. The open-weights question stays open for GMA-395 (open question 15).
 - **Facts added.** The flask-5014 image is 4.23GB (observed). The dependent search results and the unreadable run dir are now stated. The VM memory remains unverified.
 - **Revision 2 (2026-10-24).** Folded in Tom's Q1-Q3. Fixed round-1 blockers: (1) wiki cites now match their lines, and the peer-review section states the wiki conflict instead of denying it; the full anchored `Evidence`/`AnchorSpec`/`AnchorResult`/`Verdict` shape is ported. (2) Arm state has one rule: continuous per-agent history in every arm, no `claude -p`; the contradiction is gone. (3) "Done" for GMA-393 is defined once in Q5; unit 4 is a plumbing precondition. Nits fixed: plan:23 for images, ledger wording, unit 11 GRPO/CISPO wording, tool-parity check, gold-run counts, README staleness, trailing newline.
+- **Revision 3 (2026-10-24, Tom-approved final round).** Fixed round-2 blockers: (1) removed the 60-turn pooled limit and `wall_budget_sec` so the plan matches Q1 (no budget or runtime cap; `cost_usd` recorded). (2) One turn contract, matching `lesser_driver.py` on main: shared client, per-agent continuous history, explicit handoff messages, `post_message` tool, parked idle agents. Should-fixes: harness line cites re-checked against origin/main (88641058), `cost_usd` added to `ArmResult`, round-trip test names every ported type, concurrency and rollback marked settled, stale trail entries corrected.
 - **Not folded in.** Interrogate finding 15 (empty Leadership Capital ledger) is kept as a documented outcome, not changed, since zero conflicts is a valid result.
