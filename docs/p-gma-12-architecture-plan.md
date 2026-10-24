@@ -6,7 +6,7 @@
 >
 > Revision 3 (2026-10-24, Bo - Bench Eng, Tom-approved final review round): removes every turn and wall-clock cap, makes the turn contract one rule that matches the merged harness, and refreshes harness cites against origin/main 88641058.
 >
-> **Amendment A1 (2026-10-24, Tom via Morgan): the Strategic Commander is a model agent (same lesser model, paid laguna) with 2 to 4 squads. Q4, open question 7 and the code-Commander parts of sections 1 to 3 are superseded by `docs/p-gma-12-commander-amendment.md`. Guards: 200 turns per agent; 14400 s is one episode wall clock (amendment section 5). GMA-394 waits until the model Commander lands.**
+> **Amendment A1 (2026-10-24, Tom via Morgan): the Strategic Commander is a model agent (same lesser model, paid laguna) with 2 to 4 squads. The parts listed in the Precedence note of `docs/p-gma-12-commander-amendment.md` are superseded (each carries an inline A1 note); where the two differ, the amendment wins. Guards: 200 turns per agent; 14400 s is one episode wall clock (amendment section 5). GMA-394 waits until the model Commander lands.**
 
 Scope is GMA-393 (MCA command layer on the same SWE session), GMA-394 (three-arm run on a small task set) and GMA-395 (collective-advantage RLCR loop). The `mca/` package is not built yet (the 2-role smoke-test `run_team` from PR #6 is on main).
 
