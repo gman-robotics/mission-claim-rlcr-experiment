@@ -49,6 +49,11 @@ class TruncatedIds(unittest.TestCase):
         self.assertFalse(rsa.all_passed({"a": rsa.AMBIGUOUS}, {}))
 
 
+class VisibleFiles(unittest.TestCase):
+    def test_artifact_ids_are_not_files(self):
+        self.assertEqual(rsa.visible_test_files(["a.py::t", "[100%]", "b.py::u[x]", "a.py::v"]), ["a.py", "b.py"])
+
+
 class Compaction(unittest.TestCase):
     def history(self, rng, n):
         msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "T" * rng.randint(10, 20000)}]
@@ -113,6 +118,38 @@ class Guards(unittest.TestCase):
             ld.Client, ld.step, ld.Sandbox = orig_client, orig_step, orig_sandbox
         self.assertEqual(result["guard_stop"], "max_turns")
         self.assertEqual(result["guards"], {"max_turns": 3, "agent_timeout_sec": 60})
+
+    def _team(self, step_fn, checkpoint=lambda: None):
+        orig = ld.Client, ld.team_step, ld.Sandbox
+        ld.Client, ld.team_step, ld.Sandbox = self._fake(), step_fn, (lambda *a, **k: None)
+        args = types.SimpleNamespace(agent_timeout=60, max_turns=4, driver="openrouter", openai_base=None,
+                                     model="m", max_tokens_per_turn=10, key_helper="true", num_ctx=1,
+                                     text_fallback=False, compact_chars=1000, investigator_max_tokens=10,
+                                     editor_max_tokens=10, max_handoffs=6, investigator_turn_budget=12,
+                                     investigator_grace_turns=3)
+        result = {"timings": {}}
+        try:
+            ld.run_team(args, "p", "c", "/tmp", result, [], checkpoint)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            ld.Client, ld.team_step, ld.Sandbox = orig
+        return result
+
+    def test_team_max_turns_guard_stop(self):
+        def step(client, agent, *a, **k):
+            agent.stats["turns"] += 1
+            return "continue", ""
+        r = self._team(step)
+        self.assertEqual(r["guard_stop"], "max_turns")
+        self.assertEqual(r["guards"], {"max_turns": 4, "agent_timeout_sec": 60})
+
+    def test_team_interrupt_is_not_guard_stop(self):
+        def boom():
+            raise KeyboardInterrupt
+        r = self._team(lambda *a, **k: ("continue", ""), checkpoint=boom)
+        self.assertIsNone(r["guard_stop"])
+        self.assertEqual(r["llm_stats"]["stop_reason"], "interrupted")
 
 
 if __name__ == "__main__":

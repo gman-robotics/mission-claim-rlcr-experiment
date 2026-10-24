@@ -917,10 +917,16 @@ def run_claude(args, prompt, container, run_dir, result):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def visible_test_files(p2p_ids):
+    """Test files for the in-episode finish check. Ids without '::' (e.g. '[100%]') are dataset
+    artifacts, not files; passing them to pytest makes every finish fail with rc=4."""
+    return sorted({i.split("::")[0] for i in p2p_ids if "::" in i})
+
+
 def run_agent(args, prompt, container, run_dir, result):
     if args.driver in ("openrouter", "ollama"):
         import lesser_driver
-        files = sorted({i.split("::")[0] for i in args.p2p_ids})
+        files = visible_test_files(args.p2p_ids)
         prompt = prompt.replace(
             "Your only tool is exec. Use it to inspect the code and apply a fix.\n",
             "Use the tools read_file, edit_file, run and finish.\n").replace(

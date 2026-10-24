@@ -837,7 +837,7 @@ def run_team(args, prompt, container, run_dir, result, test_files, checkpoint):
     # Wake the editor no later than half the pooled turn limit, even if --max-turns is small.
     force_at = max(1, min(args.investigator_turn_budget + args.investigator_grace_turns, args.max_turns // 2))
     nudge_at = max(1, min(args.investigator_turn_budget, force_at - 1))
-    stop_reason = "turn_limit"
+    stop_reason = "interrupted"  # set to turn_limit only when the pooled turn guard ends the loop
     try:
         client = Client(args.driver, args.openai_base, args.model, args.max_tokens_per_turn,
                         key_cmd=args.key_helper, num_ctx=args.num_ctx)
@@ -877,6 +877,8 @@ def run_team(args, prompt, container, run_dir, result, test_files, checkpoint):
                 active.park()
                 other.wake(header)
                 active, other = other, active
+        else:
+            stop_reason = "turn_limit"
     except RateLimited:
         active.stats["rate_limited"] = True
         active.stats["llm_error"] = "HTTP 429"
