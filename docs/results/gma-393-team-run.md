@@ -1,4 +1,6 @@
-# GMA-393 two-agent (MCA) team run — paid poolside/laguna-s-2.1 via OpenRouter
+# GMA-393 two-agent communication / task-sharing SMOKE TEST (PR #6) — paid poolside/laguna-s-2.1 via OpenRouter
+
+> **Relabelled 2026-10-24 (Tom, Amendment A1):** this is a smoke test of two fixed roles (investigator → editor via a handoff tool, no Strategic Commander, no board, pooled 200-turn guard). It is **not** the MCA team result and must not be used as arm 1 data. The MCA team (model Commander + 2-4 squads) is specified in `docs/p-gma-12-commander-amendment.md`.
 
 Generated 2026-10-24 15:49 MDT by harness/summarize_team_runs.py from run dirs under /Users/Shared/gman-sandbox/mission-claim-rlcr/runs/ (team2 layout, started 2026-10-24 19:25Z or later). Guards: --max-turns 200 (pooled), --agent-timeout 14400 s.
 
