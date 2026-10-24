@@ -326,6 +326,12 @@ def parse_args(argv):
         default="/Users/Shared/gman-sandbox/mission-claim-rlcr/runs",
     )
     parser.add_argument("--claude-bin", default="/opt/homebrew/bin/claude")
+    parser.add_argument("--driver", choices=("claude", "openrouter", "ollama"), default="claude")
+    parser.add_argument("--key-helper", default=os.path.expanduser("~/.grok/bin/openrouter-token"))
+    parser.add_argument("--text-fallback", action="store_true", help="last resort: parse tool JSON from text (counted)")
+    parser.add_argument("--openai-base", default=None, help="default: OpenRouter v1 for openrouter, http://127.0.0.1:11434 for ollama")
+    parser.add_argument("--max-tokens-per-turn", type=int, default=2048)
+    parser.add_argument("--num-ctx", type=int, default=32768)
     parser.add_argument(
         "--canary",
         action="store_true",
@@ -853,6 +859,18 @@ def run_claude(args, prompt, container, run_dir, result):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def run_agent(args, prompt, container, run_dir, result):
+    if args.driver in ("openrouter", "ollama"):
+        import lesser_driver
+        files = sorted({i.split("::")[0] for i in args.p2p_ids})
+        prompt = prompt.replace(
+            "Your only tool is exec. Use it to inspect the code and apply a fix.\n",
+            "Use the tools read_file, edit_file, run and finish.\n").replace(
+            "Finish when the fix is done.\n", "Call finish when the fix is done.\n")
+        return lesser_driver.run(args, prompt, container, run_dir, result, files, checkpoint)
+    return run_claude(args, prompt, container, run_dir, result)
+
+
 def finish(result, run_dir):
     STATE.finalizing = True
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -933,7 +951,7 @@ def execute(args, instance, result, run_dir, mode, stamp):
         return
 
     if mode == "agent":
-        run_claude(
+        run_agent(
             args,
             agent_prompt(instance["problem_statement"]),
             work_name,
@@ -978,6 +996,7 @@ def main(argv):
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
     instance = load_instance(args.instance)
+    args.p2p_ids = instance["PASS_TO_PASS"]
     mode = "canary" if args.canary else args.mode
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     run_dir = os.path.join(
