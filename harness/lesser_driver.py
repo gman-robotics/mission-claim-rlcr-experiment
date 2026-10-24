@@ -56,7 +56,7 @@ ALL_TOOL_NAMES = TOOL_NAMES | {"handoff"}
 
 
 WRITE_PATTERNS = [
-    (r"\bsed\b[^|;&]*\s(-[a-zA-Z]*i|--in-place)", "sed -i"),
+    (r"\bsed\b[^|;&]*\s['\"]?(-[a-zA-Z]*i|--in-place)", "sed -i"),
     (r"\bperl\b[^|;&]*\s-[a-zA-Z]*i", "perl -i"),
     (r"\btee\b", "tee"),
     (r"\b(mv|cp|rm|install|truncate|dd|ln|touch|chmod|chown|mkdir|rmdir)\b", "file mutation command"),
@@ -111,8 +111,10 @@ def compact(messages, budget_chars, keep_tail=8):
     Pass 1: shrink tool results older than the last keep_tail messages, oldest first, to a one-line stub.
     Pass 2: if still over, stub every tool result except the newest one, and clip long assistant text.
     Pass 3: if still over, clip the newest tool result and older user nudges/handoffs to 2000 chars.
-    Pass 4: blank the oldest tool-result bodies. Pass 5: delete the oldest whole exchanges
-    (assistant call + its results). Pairing is preserved throughout. Mutates the list. Returns chars saved."""
+    Pass 4: blank the oldest tool-result bodies. Pass 5: clip large old tool-call arguments.
+    Pass 6: delete the oldest whole exchanges (assistant call + its results). Pass 7: clip long
+    user text including the task. Pairing is preserved throughout. Mutates the list. Returns chars saved.
+    Only the system prompt and short recent messages are irreducible."""
     total = sum(_msize(m) for m in messages)
     if total <= budget_chars:
         return 0
@@ -164,20 +166,45 @@ def compact(messages, budget_chars, keep_tail=8):
             if m.get("role") == "tool" and len(m.get("content") or "") > 9:
                 total -= len(m["content"]) - len("[dropped]")
                 m["content"] = "[dropped]"
-    while total > budget_chars:
-        # Pass 5: remove the oldest whole exchange (assistant tool_calls message plus all of its
-        # tool results), never the last two messages, so every remaining call keeps its result.
-        i = next((k for k in range(2, len(messages) - 2) if messages[k].get("role") == "assistant"), None)
-        if i is None:
-            break
-        j = i + 1
-        while j < len(messages) - 2 and messages[j].get("role") == "tool":
+    if total > budget_chars:
+        # Pass 5: clip large tool_call arguments in older assistant messages (e.g. big edit_file
+        # payloads). The call id and name stay, so its result stays paired.
+        for i in range(2, len(messages) - 2):
+            if total <= budget_chars:
+                break
+            for c in messages[i].get("tool_calls") or []:
+                f = c.get("function") or {}
+                args = f.get("arguments") or ""
+                if len(args) > 300:
+                    f["arguments"] = json.dumps({"_compacted_chars": len(args)})
+                    total -= len(args) - len(f["arguments"])
+    k = 2
+    while total > budget_chars and k < len(messages) - 2:
+        # Pass 6: delete the oldest whole exchange (assistant message plus its contiguous tool
+        # results) whose results are not in the protected last two messages. Skip, never stall.
+        if messages[k].get("role") != "assistant":
+            k += 1
+            continue
+        j = k + 1
+        while j < len(messages) and messages[j].get("role") == "tool":
             j += 1
-        if j >= len(messages) - 2 and any(messages[k].get("role") == "tool" for k in range(j, len(messages))):
-            break
-        removed = messages[i:j]
-        del messages[i:j]
+        if j > len(messages) - 2:
+            k = j
+            continue
+        removed = messages[k:j]
+        del messages[k:j]
         total -= sum(_msize(m) for m in removed)
+    if total > budget_chars:
+        # Pass 7: clip any remaining long user text, including the task / first handoff at index 1,
+        # keeping its head and tail.
+        for i in range(1, len(messages)):
+            if total <= budget_chars:
+                break
+            m = messages[i]
+            c = m.get("content") or ""
+            if m.get("role") in ("user", "tool") and len(c) > 1200:
+                m["content"] = c[:800] + "\n...[compacted]...\n" + c[-400:]
+                total -= len(c) - len(m["content"])
     return start_total - total
 
 
@@ -540,10 +567,11 @@ def step(client, slot, stats, deadline, text_fallback, agent_log):
         return True
     for c in calls:
         f = c.get("function") or {}
-        res = slot.episode.call(f.get("name"), f.get("arguments", "{}"))
-        slot.messages.append({"role": "tool", "tool_call_id": c.get("id", ""), "name": f.get("name"), "content": res})
         if slot.episode.done:
-            break
+            res = "SKIPPED: the episode already ended in this turn."
+        else:
+            res = slot.episode.call(f.get("name"), f.get("arguments", "{}"))
+        slot.messages.append({"role": "tool", "tool_call_id": c.get("id", ""), "name": f.get("name"), "content": res})
     return not slot.episode.done
 
 
@@ -638,7 +666,7 @@ def new_stats(backend):
             "protocol_rejections": {"edit_unread": 0, "edit_tests": 0, "edit_not_unique": 0,
                                     "finish_no_edit": 0, "finish_tests_failed": 0, "run_write_blocked": 0},
             "compactions": 0, "compacted_chars": 0, "cost_usd": 0.0,
-            "handoffs_sent": 0, "handoffs_rejected": 0, "parked_sec": 0.0, "active_turns": 0}
+            "handoffs_sent": 0, "handoffs_rejected": 0, "parked_sec": 0.0}
 
 
 class TeamAgent(AgentSlot):
@@ -672,7 +700,7 @@ class TeamAgent(AgentSlot):
         self.stats["parked_sec"] = round(self.stats["parked_sec"], 3)
 
 
-def team_step(client, agent, deadline, agent_log, max_handoffs, team):
+def team_step(client, agent, deadline, agent_log, max_handoffs, team, text_fallback=False):
     """One LLM turn for the active agent. Returns ("continue"|"handoff"|"done", handoff_message)."""
     st = agent.stats
     if agent.parked:  # never call the model for a parked agent
@@ -695,6 +723,9 @@ def team_step(client, agent, deadline, agent_log, max_handoffs, team):
     with open(agent_log, "a", encoding="utf-8") as h:
         h.write(json.dumps({"ts": time.time(), "agent": agent.name, "usage": usage, "message": msg}) + "\n")
     calls = msg.get("tool_calls") or []
+    if not calls and text_fallback:
+        calls = [c for c in text_fallback_calls(msg.get("content")) if c["function"]["name"] in agent.tool_names]
+        st["fallback_tool_calls"] += len(calls)
     agent.messages.append({"role": "assistant", "content": msg.get("content") or "", **({"tool_calls": calls} if calls else {})})
     if not calls:
         st["no_tool_turns"] += 1
@@ -715,10 +746,12 @@ def team_step(client, agent, deadline, agent_log, max_handoffs, team):
             if not isinstance(text, str) or not text.strip():
                 st["invalid_tool_calls"] += 1
                 res = "ERROR: handoff needs a non-empty string message."
-            elif team["handoffs"] >= max_handoffs:
+            elif agent.name == "editor" and team["handoffs"] >= max_handoffs:
+                # Only the editor can finish, so the cap only blocks handing back to the investigator;
+                # the investigator can always hand the work to the editor.
                 st["handoffs_rejected"] += 1
                 st["valid_tool_calls"] += 1
-                res = "REJECTED: handoff limit (%d) reached; continue alone with your own tools." % max_handoffs
+                res = "REJECTED: handoff limit (%d) reached; finish the fix yourself." % max_handoffs
             else:
                 st["valid_tool_calls"] += 1
                 st["by_tool"]["handoff"] = st["by_tool"].get("handoff", 0) + 1
@@ -766,6 +799,9 @@ def run_team(args, prompt, container, run_dir, result, test_files, checkpoint):
                             "Use your tools read_file, run and handoff.\n").replace(
         "Call finish when the fix is done.\n", "Call handoff to the editor when you know the fix.\n"))
     inv_nudged = False
+    # Wake the editor no later than half the pooled turn limit, even if --max-turns is small.
+    force_at = max(1, min(args.investigator_turn_budget + args.investigator_grace_turns, args.max_turns // 2))
+    nudge_at = max(1, min(args.investigator_turn_budget, force_at - 1))
     stop_reason = "turn_limit"
     try:
         client = Client(args.driver, args.openai_base, args.model, args.max_tokens_per_turn,
@@ -776,13 +812,13 @@ def run_team(args, prompt, container, run_dir, result, test_files, checkpoint):
                 break
             checkpoint()
             if (active is inv and not inv_nudged and not ed.woken_once
-                    and inv.stats["turns"] >= args.investigator_turn_budget):
+                    and inv.stats["turns"] >= nudge_at):
                 inv.messages.append({"role": "user", "content":
                                      "Investigation turn budget reached. Call handoff now with your best findings."})
                 inv_nudged = True
-            outcome, text = team_step(client, active, deadline, agent_log, args.max_handoffs, team)
+            outcome, text = team_step(client, active, deadline, agent_log, args.max_handoffs, team, args.text_fallback)
             if (outcome == "continue" and active is inv and not ed.woken_once
-                    and inv.stats["turns"] >= args.investigator_turn_budget + args.investigator_grace_turns):
+                    and inv.stats["turns"] >= force_at):
                 # Hard cap: the investigator ignored the nudge. Hand off its own notes so the
                 # editor can still act; counted as a forced handoff, not an agent handoff.
                 notes = [m.get("content") for m in inv.messages if m.get("role") == "assistant" and m.get("content")]
