@@ -152,5 +152,68 @@ class Guards(unittest.TestCase):
         self.assertEqual(r["llm_stats"]["stop_reason"], "interrupted")
 
 
+
+class ShouldFixes(unittest.TestCase):
+    def test_quoted_perl_ruby_in_place(self):
+        for c in ('perl "-i" -pe s/a/b/ f.py', "perl '-pi' -e 's/a/b/' f.py", "perl -pi -e s/a/b/ f.py",
+                  'ruby "-i" -pe x f.py'):
+            self.assertIsNotNone(ld.write_violation(c), c)
+        self.assertIsNone(ld.write_violation("perl -ne 'print if /x/' f.py"))
+
+    def test_system_prompt_over_budget_fails_closed(self):
+        msgs = [{"role": "system", "content": "S" * 5000}, {"role": "user", "content": "t"}]
+        with self.assertRaises(ld.ContextOverBudget):
+            ld.compact(msgs, 1000)
+        self.assertEqual(ld.error_record(ld.ContextOverBudget("x", kind="context over budget"))["kind"],
+                         "context over budget")
+
+    def test_text_fallback_keeps_handoff_for_team(self):
+        content = '<tool_call>{"name": "handoff", "arguments": {"message": "root cause in a.py:3"}}</tool_call>'
+        self.assertEqual(ld.text_fallback_calls(content), [])
+        calls = ld.text_fallback_calls(content, frozenset({"read_file", "run", "handoff"}))
+        self.assertEqual([c["function"]["name"] for c in calls], ["handoff"])
+
+    def _team_agent(self, name):
+        ep = ld.Episode(None, [], ld.new_stats("openrouter"))
+        return ld.TeamAgent(name, "sys", ep, "openrouter", 10, 100000)
+
+    def test_rejected_editor_handoff_is_a_failure(self):
+        ed = self._team_agent("editor")
+        ed.wake("go")
+
+        class C:
+            def chat(self, *a, **k):
+                return ({"role": "assistant", "content": "", "tool_calls": [{"id": "1", "type": "function",
+                         "function": {"name": "handoff", "arguments": json.dumps({"message": "q"})}}]}, {}, "m")
+        team = {"handoffs": 6, "events": []}
+        out, _ = ld.team_step(C(), ed, 1e12, "/tmp/gma393-test-agent.jsonl", 6, team)
+        self.assertEqual(out, "continue")
+        self.assertEqual((ed.stats["valid_tool_calls"], ed.stats["invalid_tool_calls"], ed.stats["handoffs_rejected"]), (0, 1, 1))
+
+    def test_llm_error_record_has_no_body_or_key(self):
+        exc = ld.LLMError('HTTP 400: {"error": "bad sk-or-v1-abcdef123456 body"}', kind="HTTP 400", code=400)
+        rec = ld.error_record(exc)
+        self.assertEqual(rec, {"type": "LLMError", "kind": "HTTP 400", "code": 400})
+        self.assertNotIn("sk-", json.dumps(rec))
+
+    def test_edit_not_unique_reports_lines_and_stops_after_repeats(self):
+        text = "a = 1\nb = 2\na = 1\n"
+
+        class SB:
+            def read(self, p):
+                return 0, text, ""
+        ep = ld.Episode(SB(), [], ld.new_stats("openrouter"))
+        ep.read_paths.add("/testbed/m.py")
+        args = json.dumps({"path": "/testbed/m.py", "old_text": "a = 1", "new_text": "a = 3"})
+        r1 = ep.call("edit_file", args)
+        self.assertIn("found 2 times at lines 1, 3", r1)
+        self.assertFalse(ep.done)
+        ep.call("edit_file", args)
+        r3 = ep.call("edit_file", args)
+        self.assertIn("REJECTED (final)", r3)
+        self.assertTrue(ep.done)
+        self.assertEqual(ep.stop_cause, "edit_repeat_stop")
+
+
 if __name__ == "__main__":
     unittest.main()

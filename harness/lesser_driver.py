@@ -57,7 +57,7 @@ ALL_TOOL_NAMES = TOOL_NAMES | {"handoff"}
 
 WRITE_PATTERNS = [
     (r"\bsed\b[^|;&]*\s['\"]?(-[a-zA-Z]*i|--in-place)", "sed -i"),
-    (r"\bperl\b[^|;&]*\s-[a-zA-Z]*i", "perl -i"),
+    (r"\b(perl|ruby)\b[^|;&]*\s['\"]?-[a-zA-Z]*i", "perl/ruby -i"),
     (r"\btee\b", "tee"),
     (r"\b(mv|cp|rm|install|truncate|dd|ln|touch|chmod|chown|mkdir|rmdir)\b", "file mutation command"),
     (r"\bgit\b(\s+(-c|-C)\s+\S+|\s+--\S+)*\s+(apply|am|checkout|switch|restore|reset|stash|clean|commit|rm|mv|merge|rebase|cherry-pick)\b", "git write"),
@@ -233,6 +233,10 @@ def compact(messages, budget_chars, keep_tail=8):
                     break
                 total -= size - len(new)
                 f["arguments"] = new
+    if total > budget_chars:
+        raise ContextOverBudget("history %d chars > budget %d after compaction (system prompt %d chars)"
+                                % (total, budget_chars, _msize(messages[0]) if messages else 0),
+                                kind="context over budget")
     return start_total - total
 
 
@@ -241,7 +245,24 @@ class RateLimited(Exception):
 
 
 class LLMError(Exception):
-    pass
+    """kind: short label safe for result.json (e.g. "HTTP 400"). Provider bodies stay in str(exc)
+    for local debugging only and are never written to result.json."""
+
+    def __init__(self, message, kind=None, code=None):
+        Exception.__init__(self, message)
+        self.kind = kind or str(message).split(":", 1)[0][:80]
+        self.code = code
+
+
+class ContextOverBudget(LLMError):
+    """Fail closed: the irreducible history (system prompt) alone exceeds the compaction budget."""
+
+
+def error_record(exc):
+    """Sanitized error for result.json: type, short kind, numeric code. No provider body, no key."""
+    kind = getattr(exc, "kind", None) or type(exc).__name__
+    kind = re.sub(r"(sk-[A-Za-z0-9_-]{6,}|Bearer\s+\S+)", "[redacted]", str(kind))[:80]
+    return {"type": type(exc).__name__, "kind": kind, "code": getattr(exc, "code", None)}
 
 
 def clip(text, limit=8000):
@@ -255,7 +276,7 @@ def key_from_helper(cmd):
     out = subprocess.run([cmd], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60, check=True)
     key = out.stdout.decode().strip()
     if not key:
-        raise LLMError("empty key from helper")
+        raise LLMError("empty key from helper", kind="empty key from helper")
     return key
 
 
@@ -268,7 +289,7 @@ def _post(url, payload, headers, timeout):
         body = exc.read().decode(errors="replace")[:800]
         if exc.code == 429:
             raise RateLimited(body)
-        raise LLMError("HTTP %s: %s" % (exc.code, body))
+        raise LLMError("HTTP %s: %s" % (exc.code, body), kind="HTTP %s" % exc.code, code=exc.code)
 
 
 class Client:
@@ -342,7 +363,9 @@ class Client:
         if r.get("error"):
             if (r["error"] or {}).get("code") == 429:
                 raise RateLimited(json.dumps(r["error"])[:800])
-            raise LLMError(json.dumps(r["error"])[:800])
+            code = (r["error"] or {}).get("code") if isinstance(r["error"], dict) else None
+            raise LLMError(json.dumps(r["error"])[:800], kind="provider error %s" % code if code else "provider error",
+                           code=code if isinstance(code, int) else None)
         msg = r["choices"][0]["message"]
         out = {"role": "assistant", "content": msg.get("content") or "", "tool_calls": msg.get("tool_calls") or []}
         return out, r.get("usage") or {}, r.get("model")
@@ -355,7 +378,7 @@ def _loads_or(text):
         return {}
 
 
-def text_fallback_calls(content):
+def text_fallback_calls(content, names=None):
     """Last resort only: tool JSON written as text. Strict JSON, no repair."""
     found = []
     blobs = re.findall(r"<tool_call>(.*?)</tool_call>", content or "", re.S) or re.findall(
@@ -365,7 +388,7 @@ def text_fallback_calls(content):
             obj = json.loads(blob.strip())
         except ValueError:
             continue
-        if isinstance(obj, dict) and obj.get("name") in TOOL_NAMES:
+        if isinstance(obj, dict) and obj.get("name") in (names or TOOL_NAMES):
             a = obj.get("arguments")
             found.append({"id": "t%d" % len(found), "type": "function",
                           "function": {"name": obj["name"], "arguments": a if isinstance(a, str) else json.dumps(a or {})}})
@@ -407,6 +430,15 @@ class Sandbox:
         return rc, err
 
 
+def match_lines(text, needle):
+    """1-based line numbers where needle starts in text."""
+    out, i = [], text.find(needle) if needle else -1
+    while i != -1:
+        out.append(text.count("\n", 0, i) + 1)
+        i = text.find(needle, i + 1)
+    return out
+
+
 def norm(path):
     if not isinstance(path, str) or not path:
         return None
@@ -417,10 +449,13 @@ def norm(path):
 class Episode:
     """One agent's protocol state. Team layouts create one Episode per agent sharing a Sandbox and Client."""
 
-    def __init__(self, sandbox, test_files, stats, max_finish_rejects=3):
+    def __init__(self, sandbox, test_files, stats, max_finish_rejects=3, max_identical_edit_fails=3):
         self.sb, self.test_files, self.stats = sandbox, test_files, stats
         self.read_paths, self.edits, self.finish_rejects = set(), 0, 0
         self.max_finish_rejects = max_finish_rejects
+        self.max_identical_edit_fails = max_identical_edit_fails
+        self.edit_fail_counts = {}
+        self.stop_cause = None
         self.done = False
         self.tests_passed = None
 
@@ -526,7 +561,20 @@ class Episode:
             n = text.count(args["old_text"]) if args["old_text"] else 0
             if n != 1:
                 self.stats["protocol_rejections"]["edit_not_unique"] += 1
-                return "REJECTED: old_text found %d times; it must match exactly once. Re-read the file." % n
+                key = (p, args["old_text"])
+                self.edit_fail_counts[key] = self.edit_fail_counts.get(key, 0) + 1
+                lines = match_lines(text, args["old_text"])
+                where = (" at lines %s" % ", ".join(map(str, lines[:20]))) if lines else ""
+                if self.edit_fail_counts[key] >= self.max_identical_edit_fails:
+                    self.done = True
+                    self.stop_cause = "edit_repeat_stop"
+                    self.stats["protocol_rejections"]["edit_repeat_stop"] = self.stats["protocol_rejections"].get("edit_repeat_stop", 0) + 1
+                    return ("REJECTED (final): the same edit_file failed %d times (old_text found %d times%s). Episode ends."
+                            % (self.edit_fail_counts[key], n, where))
+                hint = ("add surrounding lines so it matches exactly once" if n > 1
+                        else "re-read the file and copy the exact text, including indentation")
+                return "REJECTED: old_text found %d times%s in %s; it must match exactly once: %s. (identical failure %d of %d)" % (
+                    n, where, p, hint, self.edit_fail_counts[key], self.max_identical_edit_fails)
             rc, err = self.sb.write(p, text.replace(args["old_text"], args["new_text"], 1))
             if rc != 0:
                 return "ERROR: write failed: %s" % err[:500]
@@ -646,8 +694,10 @@ def run(args, prompt, container, run_dir, result, test_files, checkpoint):
     except RateLimited as exc:
         stats["rate_limited"] = True
         stats["llm_error"] = "HTTP 429"
+        result["llm_error"] = {"type": "RateLimited", "kind": "HTTP 429", "code": 429}
     except LLMError as exc:
-        stats["llm_error"] = str(exc).split(":", 1)[0][:80]
+        stats["llm_error"] = error_record(exc)["kind"]
+        result["llm_error"] = error_record(exc)
     finally:
         stats["llm_requests"] = client.requests if client else 0
         stats["rate_limit_hits"] = client.rate_limit_hits if client else 0
@@ -759,7 +809,7 @@ def team_step(client, agent, deadline, agent_log, max_handoffs, team, text_fallb
         h.write(json.dumps({"ts": time.time(), "agent": agent.name, "usage": usage, "message": msg}) + "\n")
     calls = msg.get("tool_calls") or []
     if not calls and text_fallback:
-        calls = [c for c in text_fallback_calls(msg.get("content")) if c["function"]["name"] in agent.tool_names]
+        calls = text_fallback_calls(msg.get("content"), agent.tool_names)
         st["fallback_tool_calls"] += len(calls)
     agent.messages.append({"role": "assistant", "content": msg.get("content") or "", **({"tool_calls": calls} if calls else {})})
     if not calls:
@@ -785,7 +835,7 @@ def team_step(client, agent, deadline, agent_log, max_handoffs, team, text_fallb
                 # Only the editor can finish, so the cap only blocks handing back to the investigator;
                 # the investigator can always hand the work to the editor.
                 st["handoffs_rejected"] += 1
-                st["valid_tool_calls"] += 1
+                st["invalid_tool_calls"] += 1
                 res = "REJECTED: handoff limit (%d) reached; finish the fix yourself." % max_handoffs
             else:
                 st["valid_tool_calls"] += 1
@@ -866,7 +916,7 @@ def run_team(args, prompt, container, run_dir, result, test_files, checkpoint):
                 team["forced_handoffs"] = team.get("forced_handoffs", 0) + 1
                 outcome = "handoff"
             if outcome == "done":
-                stop_reason = "finish_accepted" if episode.tests_passed else "finish_rejected_final"
+                stop_reason = episode.stop_cause or ("finish_accepted" if episode.tests_passed else "finish_rejected_final")
                 break
             if outcome == "handoff":
                 header = "Handoff from the %s:\n%s" % (active.name, text)
@@ -882,10 +932,12 @@ def run_team(args, prompt, container, run_dir, result, test_files, checkpoint):
     except RateLimited:
         active.stats["rate_limited"] = True
         active.stats["llm_error"] = "HTTP 429"
+        result["llm_error"] = {"type": "RateLimited", "kind": "HTTP 429", "code": 429, "agent": active.name}
         stop_reason = "rate_limited"
     except LLMError as exc:
-        active.stats["llm_error"] = str(exc).split(":", 1)[0][:80]
-        stop_reason = "llm_error"
+        active.stats["llm_error"] = error_record(exc)["kind"]
+        result["llm_error"] = dict(error_record(exc), agent=active.name)
+        stop_reason = "context_over_budget" if isinstance(exc, ContextOverBudget) else "llm_error"
     finally:
         inv.close()
         ed.close()

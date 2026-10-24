@@ -910,6 +910,9 @@ def run_claude(args, prompt, container, run_dir, result):
             result["model_reported"] = reported["model"]
             result["exec_calls"] = count_exec_calls(exec_log)
         result["agent_timeout"] = bool(ran["timed_out"])
+        result["guards"] = {"max_turns": args.max_turns, "agent_timeout_sec": args.agent_timeout}
+        # Claude Code enforces --max-turns itself and does not report a hit; only the wall-clock guard is visible here.
+        result["guard_stop"] = "agent_timeout" if ran["timed_out"] else None
         if ran["spawn_error"]:
             log("claude failed to start: %s" % ran["stderr"])
             raise Abort("agent_launch_failed")
