@@ -6,7 +6,7 @@ Task: `pallets__flask-5014` (Flask blueprint empty-name check). Image: `swebench
 
 ## Design
 
-The agent does not get a host shell. Claude's working directory is a temp dir outside this repo. Settings set `disableAllHooks` and deny `Bash`. The process is started with `--strict-mcp-config`, `--permission-mode dontAsk`, and `--disallowedTools` covering Bash, Edit, Write, Read, Glob, Grep, WebFetch, WebSearch, NotebookEdit, Task, Agent, Skill, and TodoWrite. The only allowed tool is `mcp__gma392__exec`.
+The agent does not get a host shell. Claude's working directory is a temp dir outside this repo. Settings set `disableAllHooks` and deny `Bash`. The process is started with `--strict-mcp-config`, `--permission-mode dontAsk`, and `--disallowedTools` covering Bash, Edit, Write, Read, Glob, Grep, WebFetch, WebSearch, NotebookEdit, Task, Agent, Skill, and TodoWrite. The only auto-approved work tool is `mcp__gma392__exec`. Claude Code still lists some built-in platform tools, such as CronCreate, RemoteTrigger and SendMessage. None of them is a host shell, and none can add a container mount. In the canary and agent runs the agent called only ToolSearch (to load the exec schema) and `exec`. Denying these tools too is a follow-up.
 
 `harness/exec_mcp.py` is a newline-delimited JSON-RPC MCP server. `exec` runs this argument list, with the script as one argument to `bash -lc` inside the container:
 

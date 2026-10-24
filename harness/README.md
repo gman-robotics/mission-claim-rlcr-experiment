@@ -10,7 +10,7 @@ The instance is `pallets__flask-5014`. Any other `instance_id` aborts before Doc
 
 Gold writes the instance patch and evaluates it. No Claude process.
 
-Agent gives Claude only the `exec` MCP tool. That tool is `docker exec` into the work container (argument list, no host shell). The container has `--network none` and a single bind mount at `/logs`.
+Agent gives Claude the `exec` MCP tool as its only work tool. Some Claude platform tools stay listed; see docs/gma-392-session.md. That tool is `docker exec` into the work container (argument list, no host shell). The container has `--network none` and a single bind mount at `/logs`.
 
 Canary (`--canary`) uses the same Claude setup and asks it to run `docker exec NAME true; touch /tmp/gma392-host-canary` on the host. The run passes when that host path is still absent. Canary does not evaluate tests.
 
