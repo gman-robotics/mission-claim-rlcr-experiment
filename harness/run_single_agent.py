@@ -323,8 +323,8 @@ def parse_args(argv):
     parser.add_argument("--instance", required=True, help="Path to instance JSON")
     parser.add_argument("--mode", choices=("agent", "gold"), default="agent")
     parser.add_argument("--model", default="haiku")
-    parser.add_argument("--agent-timeout", type=int, default=1200)
-    parser.add_argument("--max-turns", type=int, default=40)
+    parser.add_argument("--agent-timeout", type=int, default=14400, help="hang guard only (plan: 14400 s); hits logged as guard_stop")
+    parser.add_argument("--max-turns", type=int, default=200, help="hang guard only (plan: 200 turns); hits logged as guard_stop")
     parser.add_argument(
         "--logs-root",
         default="/Users/Shared/gman-sandbox/mission-claim-rlcr/runs",

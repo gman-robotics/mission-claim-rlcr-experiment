@@ -205,6 +205,34 @@ def compact(messages, budget_chars, keep_tail=8):
             if m.get("role") in ("user", "tool") and len(c) > 1200:
                 m["content"] = c[:800] + "\n...[compacted]...\n" + c[-400:]
                 total -= len(c) - len(m["content"])
+    if total > budget_chars:
+        # Pass 8 (hard floor): repeatedly halve the largest non-system content or tool-call
+        # argument until the history fits. Only the system prompt is irreducible.
+        while total > budget_chars:
+            best, size = None, 0
+            for i in range(1, len(messages)):
+                m = messages[i]
+                if len(m.get("content") or "") > size:
+                    best, size = ("c", m, None), len(m["content"])
+                for c in m.get("tool_calls") or []:
+                    f = c.get("function") or {}
+                    if len(f.get("arguments") or "") > size:
+                        best, size = ("a", m, f), len(f["arguments"])
+            if best is None or size <= 40:
+                break
+            over = total - budget_chars
+            keep = max(20, min(size // 2, size - over - 20))
+            kind, m, f = best
+            if kind == "c":
+                new = m["content"][:keep] + " [clip]"
+                total -= len(m["content"]) - len(new)
+                m["content"] = new
+            else:
+                new = json.dumps({"_compacted_chars": size})
+                if len(new) >= size:
+                    break
+                total -= size - len(new)
+                f["arguments"] = new
     return start_total - total
 
 
@@ -610,6 +638,11 @@ def run(args, prompt, container, run_dir, result, test_files, checkpoint):
             if not step(client, slot, stats, deadline, args.text_fallback, os.path.join(run_dir, "agent.jsonl")):
                 break
         result["agent_timeout"] = time.time() >= deadline
+        if not episode.done:
+            if result["agent_timeout"]:
+                result["guard_stop"] = "agent_timeout"
+            elif stats["turns"] >= args.max_turns:
+                result["guard_stop"] = "max_turns"
     except RateLimited as exc:
         stats["rate_limited"] = True
         stats["llm_error"] = "HTTP 429"
@@ -623,6 +656,8 @@ def run(args, prompt, container, run_dir, result, test_files, checkpoint):
         stats["tool_call_success_rate"] = round(stats["valid_tool_calls"] / total, 3) if total else None
         stats["finish_accepted"] = episode.done and bool(episode.tests_passed)
         stats["edits"] = episode.edits
+        result["guards"] = {"max_turns": args.max_turns, "agent_timeout_sec": args.agent_timeout}
+        result.setdefault("guard_stop", None)
         result["timings"]["agent_sec"] = round(time.time() - started, 3)
         result["model_reported"] = stats.pop("model_reported", None)
         result["llm_stats"] = stats
@@ -872,6 +907,9 @@ def run_team(args, prompt, container, run_dir, result, test_files, checkpoint):
         team_stats["edits"] = episode.edits
         team_stats["stop_reason"] = stop_reason
         team_stats["turn_limit_pooled"] = args.max_turns
+        result["guards"] = {"max_turns": args.max_turns, "agent_timeout_sec": args.agent_timeout}
+        result["guard_stop"] = {"turn_limit": "max_turns", "timeout": "agent_timeout"}.get(stop_reason)
+        result["agent_timeout"] = stop_reason == "timeout"
         result["layout"] = "team2"
         result["agents"] = per_agent
         result["timings"]["agent_sec"] = round(time.time() - started, 3)
