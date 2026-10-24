@@ -6,7 +6,7 @@ Task: `pallets__flask-5014` (Flask blueprint empty-name check). Image: `swebench
 
 ## Design
 
-The agent does not get a host shell. Claude's working directory is a temp dir outside this repo. Settings set `disableAllHooks` and deny `Bash`. The process is started with `--strict-mcp-config`, `--permission-mode dontAsk`, and `--disallowedTools` covering Bash, Edit, Write, Read, Glob, Grep, WebFetch, WebSearch, NotebookEdit, Task, Agent, Skill, and TodoWrite. The only auto-approved work tool is `mcp__gma392__exec`. Claude Code still lists some built-in platform tools, such as CronCreate, RemoteTrigger and SendMessage. None of them is a host shell, and none can add a container mount. In the canary and agent runs the agent called only ToolSearch (to load the exec schema) and `exec`. Denying these tools too is a follow-up.
+The agent does not get a host shell. Claude's working directory is a temp dir outside this repo. Settings set `disableAllHooks` and deny `Bash`. The process is started with `--strict-mcp-config`, `--permission-mode dontAsk`, and `--disallowedTools` covering Bash, Edit, Write, Read, Glob, Grep, WebFetch, WebSearch, NotebookEdit, Task, Agent, Skill, and TodoWrite, plus the unused Claude Code platform tools CronCreate, CronDelete, CronList, DesignSync, EnterWorktree, ExitWorktree, ListAgents, PushNotification, RemoteTrigger, ReportFindings, ScheduleWakeup, SendMessage, and TaskStop. The only auto-approved work tool is `mcp__gma392__exec`. `ToolSearch` stays allowed because the agent uses it to load the exec schema; it is not a host shell.
 
 `harness/exec_mcp.py` is a newline-delimited JSON-RPC MCP server. `exec` runs this argument list, with the script as one argument to `bash -lc` inside the container:
 
@@ -69,5 +69,5 @@ Runs on Tom's Mac, Docker Desktop 29.8.1, 2026-10-23 (MDT). Run directories are 
 - Image: `swebench/sweb.eval.x86_64.pallets_1776_flask-5014@sha256:bde4fbdafa36141d4396944da88ec37aabdef612ed36920090675bccd0ca5d72`
 - Gold gate: `pallets__flask-5014-gold-20261023T235517Z` gives `resolved`. F2P 1/1 PASSED. P2P 59/59 PASSED.
 - Canary: `pallets__flask-5014-canary-20261023T235530Z` gives `passed: true`. `/tmp/gma392-host-canary` was absent. The agent tool list had no `Bash`.
-- Agent: `pallets__flask-5014-agent-20261023T235555Z` gives `resolved`. Model `claude-haiku-5-5` (requested `haiku`, Claude Code 2.1.309, Tom's local auth). 3 exec calls. No timeout. F2P 1/1 PASSED. P2P 59/59 PASSED. Patch: empty-name `ValueError` in `src/flask/blueprints.py`.
+- Agent: `pallets__flask-5014-agent-20261023T235555Z` gives `resolved`. Model `claude-haiku-5-5` (requested `haiku`, Claude Code 2.1.310, Tom's local auth). 3 exec calls. No timeout. F2P 1/1 PASSED. P2P 59/59 PASSED. Patch: empty-name `ValueError` in `src/flask/blueprints.py`.
 - Mounts: each container had one bind mount, the run dir at `/logs`. No containers remained after the runs.
