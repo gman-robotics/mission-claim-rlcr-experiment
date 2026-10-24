@@ -326,10 +326,10 @@ def parse_args(argv):
         default="/Users/Shared/gman-sandbox/mission-claim-rlcr/runs",
     )
     parser.add_argument("--claude-bin", default="/opt/homebrew/bin/claude")
-    parser.add_argument("--driver", choices=("claude", "openai", "openrouter", "ollama"), default="claude")
+    parser.add_argument("--driver", choices=("claude", "openrouter", "ollama"), default="claude")
     parser.add_argument("--key-helper", default=os.path.expanduser("~/.grok/bin/openrouter-token"))
     parser.add_argument("--text-fallback", action="store_true", help="last resort: parse tool JSON from text (counted)")
-    parser.add_argument("--openai-base", default="http://127.0.0.1:11434/v1")
+    parser.add_argument("--openai-base", default=None, help="default: OpenRouter v1 for openrouter, http://127.0.0.1:11434 for ollama")
     parser.add_argument("--max-tokens-per-turn", type=int, default=2048)
     parser.add_argument("--num-ctx", type=int, default=32768)
     parser.add_argument(
@@ -859,152 +859,6 @@ def run_claude(args, prompt, container, run_dir, result):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-OPENAI_SYSTEM = (
-    "You are a software engineer fixing a bug in a Python repository inside a Linux container.\n"
-    "You have one tool, exec, which runs a bash script in /testbed and returns rc, stdout and stderr.\n"
-    "Inspect the code, make a minimal source fix (do not modify tests), and verify it.\n"
-    "Edit files with a python3 heredoc (read file, str.replace, write), not sed.\n"
-    "Only reply DONE (with no tool call) after a command shows the fix works."
-)
-
-EXEC_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "exec",
-        "description": "Run a bash script in /testbed inside the task container. No network.",
-        "parameters": {
-            "type": "object",
-            "properties": {"script": {"type": "string", "description": "bash script"}},
-            "required": ["script"],
-        },
-    },
-}
-
-
-def openai_chat(base, payload, timeout):
-    import urllib.request
-    req = urllib.request.Request(
-        base.rstrip("/") + "/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": "Bearer local"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def clip(text, limit=8000):
-    if len(text) <= limit:
-        return text
-    return text[: limit // 2] + "\n...[truncated]...\n" + text[-limit // 2:]
-
-
-def calls_from_content(content):
-    """Qwen2.5-Coder often writes tool calls as JSON text instead of tool_calls."""
-    import re
-    text = (content or "").strip()
-    found = []
-    blobs = re.findall(r"<tool_call>(.*?)</tool_call>", text, re.S) or re.findall(
-        r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S) or [
-        re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
-    ]
-    for blob in blobs:
-        try:
-            obj = json.loads(blob.strip())
-        except ValueError:
-            m = re.search(r'"name"\s*:\s*"exec".*?"script"\s*:\s*"(.*)', blob, re.S)
-            if not m:
-                continue
-            raw = re.sub(r'"?\s*}\s*}\s*$', "", m.group(1).strip())
-            try:
-                script = json.loads('"' + raw + '"')
-            except ValueError:
-                script = raw.replace('\\n', '\n').replace('\\"', '"')
-            obj = {"name": "exec", "arguments": {"script": script}}
-        if isinstance(obj, dict) and obj.get("name") == "exec":
-            argsv = obj.get("arguments")
-            if isinstance(argsv, dict):
-                argsv = json.dumps(argsv)
-            found.append({"id": "c%d" % len(found), "type": "function",
-                          "function": {"name": "exec", "arguments": argsv or "{}"}})
-    return found
-
-
-def run_openai(args, prompt, container, run_dir, result):
-    """Minimal OpenAI-compatible tool loop. Tool = docker exec bash -lc in the work container."""
-    checkpoint()
-    exec_log = os.path.join(run_dir, "exec.jsonl")
-    agent_log = os.path.join(run_dir, "agent.jsonl")
-    messages = [
-        {"role": "system", "content": OPENAI_SYSTEM},
-        {"role": "user", "content": prompt},
-    ]
-    stats = {"turns": 0, "prompt_tokens": 0, "completion_tokens": 0, "llm_sec": 0.0}
-    started = time.time()
-    deadline = started + args.agent_timeout
-    try:
-        for _ in range(args.max_turns):
-            checkpoint()
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                result["agent_timeout"] = True
-                break
-            payload = {
-                "model": args.model,
-                "messages": messages,
-                "tools": [EXEC_TOOL],
-                "max_tokens": args.max_tokens_per_turn,
-                "temperature": 0.2,
-                "options": {"num_ctx": args.num_ctx},
-            }
-            t = time.time()
-            try:
-                resp = openai_chat(args.openai_base, payload, timeout=max(5, remaining))
-            except Exception as exc:
-                log("llm call failed: %s" % exc)
-                raise Abort("agent_launch_failed")
-            stats["llm_sec"] += time.time() - t
-            stats["turns"] += 1
-            usage = resp.get("usage") or {}
-            stats["prompt_tokens"] += usage.get("prompt_tokens") or 0
-            stats["completion_tokens"] += usage.get("completion_tokens") or 0
-            if result.get("model_reported") is None:
-                result["model_reported"] = resp.get("model")
-            msg = resp["choices"][0]["message"]
-            with open(agent_log, "a", encoding="utf-8") as h:
-                h.write(json.dumps({"ts": time.time(), "usage": usage, "message": msg}) + "\n")
-            calls = msg.get("tool_calls") or []
-            if not calls:
-                calls = calls_from_content(msg.get("content"))
-                if calls:
-                    stats["text_tool_calls"] = stats.get("text_tool_calls", 0) + len(calls)
-                    msg = {"role": "assistant", "content": "", "tool_calls": calls}
-            messages.append({k: v for k, v in msg.items() if k in ("role", "content", "tool_calls")})
-            if not calls:
-                break
-            for call in calls:
-                try:
-                    script = json.loads(call["function"]["arguments"]).get("script", "")
-                except Exception:
-                    script = ""
-                ran = docker_exec(container, ["bash", "-lc", script], timeout=120)
-                rc = ran["rc"] if isinstance(ran["rc"], int) else -1
-                with open(exec_log, "a", encoding="utf-8") as h:
-                    h.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                                        "script": script, "rc": rc,
-                                        "stdout": ran["stdout"], "stderr": ran["stderr"]}) + "\n")
-                out = "rc=%s\nstdout:\n%s\nstderr:\n%s" % (rc, clip(ran["stdout"]), clip(ran["stderr"], 3000))
-                messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": out})
-    finally:
-        elapsed = time.time() - started
-        result["timings"]["agent_sec"] = round(elapsed, 3)
-        result["exec_calls"] = count_exec_calls(exec_log)
-        stats["llm_sec"] = round(stats["llm_sec"], 3)
-        stats["completion_tok_per_llm_sec"] = (
-            round(stats["completion_tokens"] / stats["llm_sec"], 2) if stats["llm_sec"] else None
-        )
-        result["llm_stats"] = stats
-
-
 def run_agent(args, prompt, container, run_dir, result):
     if args.driver in ("openrouter", "ollama"):
         import lesser_driver
@@ -1014,8 +868,6 @@ def run_agent(args, prompt, container, run_dir, result):
             "Use the tools read_file, edit_file, run and finish.\n").replace(
             "Finish when the fix is done.\n", "Call finish when the fix is done.\n")
         return lesser_driver.run(args, prompt, container, run_dir, result, files, checkpoint)
-    if args.driver == "openai":
-        return run_openai(args, prompt, container, run_dir, result)
     return run_claude(args, prompt, container, run_dir, result)
 
 
