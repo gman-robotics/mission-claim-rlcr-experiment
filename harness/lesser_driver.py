@@ -14,6 +14,7 @@ import json
 import os
 import posixpath
 import re
+import shlex
 import subprocess
 import time
 import urllib.error
@@ -134,6 +135,8 @@ class Client:
     """One shared client; agents in a team call the same instance (same weights, same quota)."""
 
     def __init__(self, backend, base, model, max_tokens, key_cmd=None, num_ctx=32768):
+        if not base:
+            base = "https://openrouter.ai/api/v1" if backend == "openrouter" else "http://127.0.0.1:11434"
         self.backend, self.base, self.model = backend, base.rstrip("/"), model
         self.max_tokens, self.num_ctx = max_tokens, num_ctx
         self.key = key_from_helper(key_cmd) if backend == "openrouter" else None
@@ -164,6 +167,8 @@ class Client:
                                         "arguments": _loads_or(c["function"]["arguments"])}}
                                        for c in m["tool_calls"]]
                 m.pop("tool_call_id", None)
+                if m.get("role") == "tool" and "name" in m:
+                    m["tool_name"] = m.pop("name")
                 msgs.append(m)
             r = _post(self.base + "/api/chat", {"model": self.model, "messages": msgs, "tools": TOOLS,
                       "stream": False, "options": {"num_predict": self.max_tokens, "num_ctx": self.num_ctx,
@@ -185,7 +190,7 @@ class Client:
         try:
             r = _post(self.base + "/chat/completions", payload, headers, timeout)
         except LLMError as exc:
-            if self.tool_choice == "required" and "tool_choice" in str(exc):
+            if self.tool_choice == "required" and str(exc).startswith("HTTP 400") and "tool_choice" in str(exc):
                 self.tool_choice = "auto"
                 self.requests += 1
                 payload["tool_choice"] = "auto"
@@ -244,7 +249,7 @@ class Sandbox:
                                 "script": detail, "rc": rc, "stdout": out[-20000:], "stderr": err[-5000:]}) + "\n")
 
     def run(self, command, timeout=120):
-        rc, out, err = self._docker(["bash", "-lc", command], timeout)
+        rc, out, err = self._docker(["timeout", "-k", "5", str(timeout), "bash", "-lc", command], timeout + 15)
         self.log("run", command, rc, out, err)
         return rc, out, err
 
@@ -278,14 +283,19 @@ class Episode:
         self.tests_passed = None
 
     def visible_tests(self):
+        """Same interpreter as the harness eval (conda testbed, python -m pytest), PASS_TO_PASS files only.
+        Accept only pytest rc 0 with a parsed summary that has passes and no failures/errors."""
         if not self.test_files:
             return True, "no visible tests configured"
-        rc, out, err = self.sb.run(
-            "source /opt/miniconda3/etc/profile.d/conda.sh 2>/dev/null && conda activate testbed 2>/dev/null; "
-            "python -m pytest -q -p no:cacheprovider " + " ".join(self.test_files) + " 2>&1 | tail -30", 900)
-        tail = out.strip().splitlines()[-1:] or [""]
-        ok = bool(re.search(r"\d+ passed", tail[0])) and not re.search(r"\b\d+ (failed|errors?)\b", tail[0])
-        return ok, out
+        files = " ".join(shlex.quote(f) for f in self.test_files)
+        cmd = ("source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed && "
+               "python -m pytest -q -p no:cacheprovider " + files)
+        rc, out, err = self.sb.run(cmd, 900)
+        summary = [l for l in out.splitlines() if re.search(r"\d+ (passed|failed|errors?)\b.* in [\d.]+s", l)]
+        last = summary[-1] if summary else ""
+        ok = (rc == 0 and bool(re.search(r"\b\d+ passed\b", last))
+              and not re.search(r"\b\d+ (failed|errors?)\b", last))
+        return ok, "pytest rc=%s\n%s" % (rc, clip(out, 6000))
 
     def call(self, name, raw_args):
         """Return tool result text. Errors are returned to the model (fail closed), never executed."""
@@ -305,7 +315,7 @@ class Episode:
             self.stats["invalid_tool_calls"] += 1
             return "ERROR: missing or non-string argument(s): %s" % ", ".join(missing)
         self.stats["valid_tool_calls"] += 1
-        self.stats["by_tool"][name] = self.stats["by_tool"].get(name, 0) + 1
+        self.stats["by_tool"][name] = self.stats["by_tool"].get(name, 0) + 1  # attempts, incl. rejected
         if name == "run":
             why = write_violation(args["command"])
             if why:
@@ -321,10 +331,12 @@ class Episode:
             rc, out, err = self.sb.read(p)
             if rc != 0:
                 return "ERROR: cannot read %s: %s" % (p, err.strip()[:500])
-            self.read_paths.add(p)
             lines = out.splitlines()
             s = max(1, int(args.get("start_line") or 1)) if str(args.get("start_line") or "1").isdigit() else 1
             e = int(args.get("end_line")) if str(args.get("end_line") or "").isdigit() else min(len(lines), s + 399)
+            if e < s and lines:
+                return "ERROR: end_line must be >= start_line"
+            self.read_paths.add(p)
             body = "\n".join("%6d  %s" % (i, lines[i - 1]) for i in range(s, min(e, len(lines)) + 1))
             return "%s (%d lines total, showing %d-%d)\n%s" % (p, len(lines), s, min(e, len(lines)), clip(body, 24000))
         if name == "edit_file":
@@ -334,7 +346,9 @@ class Episode:
             if p not in self.read_paths:
                 self.stats["protocol_rejections"]["edit_unread"] += 1
                 return "REJECTED: read_file %s before editing it." % p
-            if "/tests/" in p or posixpath.basename(p).startswith("test_"):
+            base = posixpath.basename(p)
+            if ("/tests/" in p or "/testing/" in p or base.startswith("test_") or base.endswith("_test.py")
+                    or base in ("conftest.py", "tests.py")):
                 self.stats["protocol_rejections"]["edit_tests"] += 1
                 return "REJECTED: do not modify tests."
             rc, text, err = self.sb.read(p)
@@ -417,6 +431,19 @@ def step(client, slot, stats, deadline, text_fallback, agent_log):
     return not slot.episode.done
 
 
+def _count_logged(path):
+    n = 0
+    if os.path.isfile(path):
+        for line in open(path, encoding="utf-8"):
+            try:
+                rc = json.loads(line).get("rc")
+            except ValueError:
+                continue
+            if isinstance(rc, int) and not isinstance(rc, bool):
+                n += 1
+    return n
+
+
 def run(args, prompt, container, run_dir, result, test_files, checkpoint):
     stats = {"backend": args.driver, "turns": 0, "llm_requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
              "llm_sec": 0.0, "valid_tool_calls": 0, "invalid_tool_calls": 0, "fallback_tool_calls": 0,
@@ -441,9 +468,9 @@ def run(args, prompt, container, run_dir, result, test_files, checkpoint):
         result["agent_timeout"] = time.time() >= deadline
     except RateLimited as exc:
         stats["rate_limited"] = True
-        stats["llm_error"] = str(exc)[:500]
+        stats["llm_error"] = "HTTP 429"
     except LLMError as exc:
-        stats["llm_error"] = str(exc)[:500]
+        stats["llm_error"] = str(exc).split(":", 1)[0][:80]
     finally:
         stats["llm_requests"] = client.requests if client else 0
         stats["rate_limit_hits"] = client.rate_limit_hits if client else 0
@@ -455,4 +482,4 @@ def run(args, prompt, container, run_dir, result, test_files, checkpoint):
         result["timings"]["agent_sec"] = round(time.time() - started, 3)
         result["model_reported"] = stats.pop("model_reported", None)
         result["llm_stats"] = stats
-        result["exec_calls"] = stats["by_tool"].get("run", 0) + stats["by_tool"].get("edit_file", 0) + stats["by_tool"].get("read_file", 0)
+        result["exec_calls"] = _count_logged(os.path.join(run_dir, "exec.jsonl"))
