@@ -49,10 +49,14 @@ TOOLS = [
         {"summary": {"type": "string"}}, ["summary"]),
 ]
 TOOL_NAMES = {t["function"]["name"] for t in TOOLS}
+HANDOFF_TOOL = _fn("handoff", "Hand the task to your teammate with a self-contained message. You are parked until they hand back.",
+                   {"message": {"type": "string"}}, ["message"])
+ALL_TOOLS = TOOLS + [HANDOFF_TOOL]
+ALL_TOOL_NAMES = TOOL_NAMES | {"handoff"}
 
 
 WRITE_PATTERNS = [
-    (r"\bsed\b[^|;&]*\s-[a-zA-Z]*i", "sed -i"),
+    (r"\bsed\b[^|;&]*\s(-[a-zA-Z]*i|--in-place)", "sed -i"),
     (r"\bperl\b[^|;&]*\s-[a-zA-Z]*i", "perl -i"),
     (r"\btee\b", "tee"),
     (r"\b(mv|cp|rm|install|truncate|dd|ln|touch|chmod|chown|mkdir|rmdir)\b", "file mutation command"),
@@ -74,32 +78,107 @@ def write_violation(command):
     for pat, why in WRITE_PATTERNS:
         if re.search(pat, command):
             return why
-    stripped = _SAFE_REDIRECT.sub(" ", command)
-    stripped = re.sub(r"'[^']*'|\"[^\"]*\"", "''", stripped)
-    if re.search(r"(?<![<>=!-])>>?(?!=)", stripped):
+    if _has_redirect(command):
         return "output redirect to a file"
+    # Quoted text is normally skipped for redirects (python -c "print(1 > 0)"), but a quoted string
+    # handed to a shell (os.system, subprocess, popen, sh -c, bash -c, eval) is itself a command.
+    if re.search(r"\bos\.(system|popen|exec\w*|spawn\w*)|\bsubprocess\b|\bpopen\b|\b(ba|z|da)?sh\s+-\w*c\b|\beval\b", command):
+        for quoted in re.findall(r"'([^']*)'|\"([^\"]*)\"", command):
+            inner = quoted[0] or quoted[1]
+            if _has_redirect(inner) or _has_redirect_raw(inner):
+                return "output redirect inside a shell string"
     return None
 
 
+def _has_redirect(text):
+    stripped = _SAFE_REDIRECT.sub(" ", text)
+    stripped = re.sub(r"'[^']*'|\"[^\"]*\"", "''", stripped)
+    return bool(re.search(r"(?<![<>=!-])>>?(?!=)", stripped))
+
+
+def _has_redirect_raw(text):
+    """Redirect check without quote stripping (for strings that a shell will execute)."""
+    stripped = _SAFE_REDIRECT.sub(" ", text)
+    return bool(re.search(r"(?<![<>=!-])>>?(?!=)", stripped))
+
+
+def _msize(m):
+    return len(m.get("content") or "") + sum(len(json.dumps(c)) for c in (m.get("tool_calls") or []))
+
+
 def compact(messages, budget_chars, keep_tail=8):
-    """Shrink old tool results (never the system/task prompt or the last keep_tail messages).
-    Tool-call/result pairing is preserved; only content is replaced. Returns chars saved."""
-    def size(m):
-        return len(m.get("content") or "") + sum(len(json.dumps(c)) for c in (m.get("tool_calls") or []))
-    total = sum(size(m) for m in messages)
+    """Bring the history under budget_chars. Never touches messages[0:2] (system, task).
+    Pass 1: shrink tool results older than the last keep_tail messages, oldest first, to a one-line stub.
+    Pass 2: if still over, stub every tool result except the newest one, and clip long assistant text.
+    Pass 3: if still over, clip the newest tool result and older user nudges/handoffs to 2000 chars.
+    Pass 4: blank the oldest tool-result bodies. Pass 5: delete the oldest whole exchanges
+    (assistant call + its results). Pairing is preserved throughout. Mutates the list. Returns chars saved."""
+    total = sum(_msize(m) for m in messages)
     if total <= budget_chars:
         return 0
-    saved = 0
-    for m in messages[2:max(2, len(messages) - keep_tail)]:
+    start_total = total
+
+    def stub(m, keep=160):
         c = m.get("content") or ""
-        if m.get("role") == "tool" and len(c) > 200 and not c.startswith("[compacted"):
-            first = c.splitlines()[0][:160] if c else ""
-            m["content"] = "[compacted %d chars] %s" % (len(c), first)
-            saved += len(c) - len(m["content"])
-            total -= len(c) - len(m["content"])
-            if total <= budget_chars * 0.7:
+        first = c.splitlines()[0][:keep] if c else ""
+        new = "[compacted %d chars] %s" % (len(c), first)
+        if len(new) < len(c):
+            m["content"] = new
+            return len(c) - len(new)
+        return 0
+
+    body = list(range(2, len(messages)))
+    tool_idx = [i for i in body if messages[i].get("role") == "tool"]
+    for i in [i for i in tool_idx if i < len(messages) - keep_tail]:
+        if total <= budget_chars * 0.7:
+            break
+        total -= stub(messages[i])
+    if total > budget_chars:
+        for i in tool_idx[:-1]:
+            if total <= budget_chars * 0.9:
                 break
-    return saved
+            total -= stub(messages[i], keep=80)
+        for i in body[:-1]:
+            m = messages[i]
+            if total <= budget_chars * 0.9:
+                break
+            if m.get("role") == "assistant" and len(m.get("content") or "") > 500:
+                c = m["content"]
+                m["content"] = c[:500] + " [clipped]"
+                total -= len(c) - len(m["content"])
+    if total > budget_chars:
+        for i in body:
+            m = messages[i]
+            if total <= budget_chars:
+                break
+            c = m.get("content") or ""
+            if m.get("role") in ("tool", "user") and len(c) > 2000:
+                m["content"] = c[:1000] + "\n...[compacted]...\n" + c[-1000:]
+                total -= len(c) - len(m["content"])
+    if total > budget_chars:
+        # Pass 4: blank the oldest tool-result bodies (keeps the result message, so pairing holds).
+        for i in range(2, len(messages) - 2):
+            if total <= budget_chars:
+                break
+            m = messages[i]
+            if m.get("role") == "tool" and len(m.get("content") or "") > 9:
+                total -= len(m["content"]) - len("[dropped]")
+                m["content"] = "[dropped]"
+    while total > budget_chars:
+        # Pass 5: remove the oldest whole exchange (assistant tool_calls message plus all of its
+        # tool results), never the last two messages, so every remaining call keeps its result.
+        i = next((k for k in range(2, len(messages) - 2) if messages[k].get("role") == "assistant"), None)
+        if i is None:
+            break
+        j = i + 1
+        while j < len(messages) - 2 and messages[j].get("role") == "tool":
+            j += 1
+        if j >= len(messages) - 2 and any(messages[k].get("role") == "tool" for k in range(j, len(messages))):
+            break
+        removed = messages[i:j]
+        del messages[i:j]
+        total -= sum(_msize(m) for m in removed)
+    return start_total - total
 
 
 class RateLimited(Exception):
@@ -150,18 +229,18 @@ class Client:
         self.rate_limit_hits = 0
         self.tool_choice = "required"
 
-    def chat(self, messages, timeout, retries=6):
+    def chat(self, messages, timeout, retries=6, tools=None, max_tokens=None):
         """Retry 429s with backoff (15, 30, 60, 60... s); counts each 429 in self.rate_limit_hits."""
         for attempt in range(retries + 1):
             try:
-                return self._chat(messages, timeout)
+                return self._chat(messages, timeout, tools or TOOLS, max_tokens or self.max_tokens)
             except RateLimited:
                 self.rate_limit_hits += 1
                 if attempt == retries:
                     raise
                 time.sleep(min(60, 15 * (2 ** attempt)))
 
-    def _chat(self, messages, timeout):
+    def _chat(self, messages, timeout, tools, max_tokens):
         """Return (assistant_message, usage, model_name). tool_calls arguments are raw strings."""
         self.requests += 1
         if self.backend == "ollama":
@@ -176,8 +255,8 @@ class Client:
                 if m.get("role") == "tool" and "name" in m:
                     m["tool_name"] = m.pop("name")
                 msgs.append(m)
-            r = _post(self.base + "/api/chat", {"model": self.model, "messages": msgs, "tools": TOOLS,
-                      "stream": False, "options": {"num_predict": self.max_tokens, "num_ctx": self.num_ctx,
+            r = _post(self.base + "/api/chat", {"model": self.model, "messages": msgs, "tools": tools,
+                      "stream": False, "options": {"num_predict": max_tokens, "num_ctx": self.num_ctx,
                                                    "temperature": 0.2}}, {"Content-Type": "application/json"}, timeout)
             msg = r.get("message") or {}
             calls = []
@@ -188,8 +267,8 @@ class Client:
                               "function": {"name": f.get("name"), "arguments": a if isinstance(a, str) else json.dumps(a)}})
             usage = {"prompt_tokens": r.get("prompt_eval_count", 0), "completion_tokens": r.get("eval_count", 0)}
             return {"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls}, usage, r.get("model")
-        payload = {"model": self.model, "messages": messages, "tools": TOOLS, "tool_choice": self.tool_choice,
-                   "max_tokens": self.max_tokens, "temperature": 0.2,
+        payload = {"model": self.model, "messages": messages, "tools": tools, "tool_choice": self.tool_choice,
+                   "max_tokens": max_tokens, "temperature": 0.2,
                    "usage": {"include": True}}
         headers = {"Content-Type": "application/json", "Authorization": "Bearer " + self.key,
                    "X-Title": "gma-393-harness"}
@@ -305,8 +384,23 @@ class Episode:
               and not re.search(r"\b\d+ (failed|errors?)\b", last))
         return ok, "pytest rc=%s\n%s\nstderr:\n%s" % (rc, clip(out, 6000), clip(err, 2000))
 
-    def call(self, name, raw_args):
-        """Return tool result text. Errors are returned to the model (fail closed), never executed."""
+    def call(self, name, raw_args, agent=None):
+        """Return tool result text. Errors are returned to the model (fail closed), never executed.
+        agent (team mode): its own read set (read-before-edit is per agent), stats and allowed tools."""
+        saved = (self.stats, self.read_paths)
+        allowed = TOOL_NAMES
+        if agent is not None:
+            self.stats, self.read_paths = agent.stats, agent.read_paths
+            allowed = agent.tool_names
+        try:
+            return self._call(name, raw_args, allowed)
+        finally:
+            self.stats, self.read_paths = saved
+
+    def _call(self, name, raw_args, allowed):
+        if name == "handoff":
+            self.stats["invalid_tool_calls"] += 1
+            return "ERROR: handoff is only available in team mode."
         try:
             args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
             if not isinstance(args, dict):
@@ -314,10 +408,10 @@ class Episode:
         except Exception as exc:
             self.stats["invalid_tool_calls"] += 1
             return "ERROR: invalid tool arguments JSON (%s). Re-issue the call with valid JSON." % exc
-        if name not in TOOL_NAMES:
+        if name not in allowed or name not in ALL_TOOL_NAMES:
             self.stats["invalid_tool_calls"] += 1
-            return "ERROR: unknown tool %r. Tools: %s" % (name, ", ".join(sorted(TOOL_NAMES)))
-        missing = [k for k in next(t for t in TOOLS if t["function"]["name"] == name)["function"]["parameters"]["required"]
+            return "ERROR: unknown or not-allowed tool %r. Your tools: %s" % (name, ", ".join(sorted(allowed)))
+        missing = [k for k in next(t for t in ALL_TOOLS if t["function"]["name"] == name)["function"]["parameters"]["required"]
                    if not isinstance(args.get(k), str)]
         if missing:
             self.stats["invalid_tool_calls"] += 1
@@ -504,4 +598,247 @@ def run(args, prompt, container, run_dir, result, test_files, checkpoint):
         result["timings"]["agent_sec"] = round(time.time() - started, 3)
         result["model_reported"] = stats.pop("model_reported", None)
         result["llm_stats"] = stats
+        result["exec_calls"] = _count_logged(os.path.join(run_dir, "exec.jsonl"))
+
+
+# ---------------------------------------------------------------------------
+# Team mode (MCA 2-agent): investigator + editor, one shared client, one shared container.
+
+INVESTIGATOR_SYSTEM = (
+    "You are the INVESTIGATOR on a two-agent team fixing a bug in the Python repository at /testbed "
+    "(Linux container, no network). Your teammate is the EDITOR, who makes the code change.\n"
+    "Your tools: read_file, run (read-only: no redirects, sed -i, mv, cp, tee or scripts that write files), handoff.\n"
+    "You cannot edit files or finish.\n"
+    "1. Find the root cause: locate the exact file, function and lines.\n"
+    "2. Then call handoff with a self-contained message: files and line numbers, root cause, the minimal change "
+    "you propose (exact old and new code if you can), and how to verify it.\n"
+    "Be efficient. If the editor hands back a question, answer it and hand off again."
+)
+
+EDITOR_SYSTEM = (
+    "You are the EDITOR on a two-agent team fixing a bug in the Python repository at /testbed "
+    "(Linux container, no network). The INVESTIGATOR has studied the bug and hands you findings.\n"
+    "Your tools: read_file, edit_file, run (read-only), finish, handoff.\n"
+    "Protocol: read_file a file before edit_file on it; edit_file replaces an exact, unique snippet; "
+    "make a minimal source fix; do not modify tests; verify with run (e.g. a quick python check or pytest).\n"
+    "Call finish when done. The harness runs the existing tests; finish is rejected if they fail.\n"
+    "Only if the findings are wrong or insufficient, call handoff with a specific question for the investigator."
+)
+
+ROLE_TOOLS = {
+    "investigator": ("read_file", "run", "handoff"),
+    "editor": ("read_file", "edit_file", "run", "finish", "handoff"),
+}
+
+
+def new_stats(backend):
+    return {"backend": backend, "turns": 0, "llm_requests": 0, "prompt_tokens": 0, "completion_tokens": 0,
+            "llm_sec": 0.0, "valid_tool_calls": 0, "invalid_tool_calls": 0, "fallback_tool_calls": 0,
+            "no_tool_turns": 0, "parked_skips": 0, "by_tool": {}, "rate_limited": False, "llm_error": None,
+            "protocol_rejections": {"edit_unread": 0, "edit_tests": 0, "edit_not_unique": 0,
+                                    "finish_no_edit": 0, "finish_tests_failed": 0, "run_write_blocked": 0},
+            "compactions": 0, "compacted_chars": 0, "cost_usd": 0.0,
+            "handoffs_sent": 0, "handoffs_rejected": 0, "parked_sec": 0.0, "active_turns": 0}
+
+
+class TeamAgent(AgentSlot):
+    def __init__(self, name, system, episode, backend, max_tokens, budget_chars):
+        AgentSlot.__init__(self, name, system, episode)
+        self.tool_names = frozenset(ROLE_TOOLS[name])
+        self.tools = [t for t in ALL_TOOLS if t["function"]["name"] in self.tool_names]
+        self.stats = new_stats(backend)
+        self.read_paths = set()
+        self.max_tokens = max_tokens
+        self.budget_chars = budget_chars
+        self.parked_since = time.time()
+        self.woken_once = False
+
+    def wake(self, message):
+        if self.parked and self.parked_since is not None:
+            self.stats["parked_sec"] += time.time() - self.parked_since
+        self.parked_since = None
+        self.woken_once = True
+        AgentSlot.wake(self, message)
+
+    def park(self):
+        if not self.parked:
+            self.parked_since = time.time()
+        AgentSlot.park(self)
+
+    def close(self):
+        if self.parked and self.parked_since is not None:
+            self.stats["parked_sec"] += time.time() - self.parked_since
+            self.parked_since = None
+        self.stats["parked_sec"] = round(self.stats["parked_sec"], 3)
+
+
+def team_step(client, agent, deadline, agent_log, max_handoffs, team):
+    """One LLM turn for the active agent. Returns ("continue"|"handoff"|"done", handoff_message)."""
+    st = agent.stats
+    if agent.parked:  # never call the model for a parked agent
+        st["parked_skips"] += 1
+        return "continue", None
+    saved = compact(agent.messages, agent.budget_chars)
+    if saved:
+        st["compactions"] += 1
+        st["compacted_chars"] += saved
+    t = time.time()
+    msg, usage, model = client.chat(agent.messages, timeout=max(10, min(300, deadline - time.time())),
+                                    tools=agent.tools, max_tokens=agent.max_tokens)
+    st["llm_sec"] += time.time() - t
+    st["turns"] += 1
+    st["llm_requests"] += 1
+    st["prompt_tokens"] += usage.get("prompt_tokens") or 0
+    st["completion_tokens"] += usage.get("completion_tokens") or 0
+    st["cost_usd"] = round(st["cost_usd"] + float(usage.get("cost") or 0), 6)
+    team["model_reported"] = team.get("model_reported") or model
+    with open(agent_log, "a", encoding="utf-8") as h:
+        h.write(json.dumps({"ts": time.time(), "agent": agent.name, "usage": usage, "message": msg}) + "\n")
+    calls = msg.get("tool_calls") or []
+    agent.messages.append({"role": "assistant", "content": msg.get("content") or "", **({"tool_calls": calls} if calls else {})})
+    if not calls:
+        st["no_tool_turns"] += 1
+        agent.messages.append({"role": "user", "content": "No tool call received. Use one of your tools."})
+        return "continue", None
+    outcome, handoff_msg = "continue", None
+    for c in calls:
+        f = c.get("function") or {}
+        name = f.get("name")
+        if outcome != "continue":
+            res = "SKIPPED: an earlier call in this turn ended your turn."
+        elif name == "handoff" and "handoff" in agent.tool_names:
+            try:
+                a = json.loads(f.get("arguments") or "{}")
+                text = a.get("message") if isinstance(a, dict) else None
+            except ValueError:
+                text = None
+            if not isinstance(text, str) or not text.strip():
+                st["invalid_tool_calls"] += 1
+                res = "ERROR: handoff needs a non-empty string message."
+            elif team["handoffs"] >= max_handoffs:
+                st["handoffs_rejected"] += 1
+                st["valid_tool_calls"] += 1
+                res = "REJECTED: handoff limit (%d) reached; continue alone with your own tools." % max_handoffs
+            else:
+                st["valid_tool_calls"] += 1
+                st["by_tool"]["handoff"] = st["by_tool"].get("handoff", 0) + 1
+                st["handoffs_sent"] += 1
+                team["handoffs"] += 1
+                outcome, handoff_msg = "handoff", text.strip()
+                res = "OK: handed off. You are parked until your teammate hands back."
+        else:
+            res = agent.episode.call(name, f.get("arguments", "{}"), agent=agent)
+            if agent.episode.done:
+                outcome = "done"
+        agent.messages.append({"role": "tool", "tool_call_id": c.get("id", ""), "name": name, "content": res})
+    return outcome, handoff_msg
+
+
+def _sum_stats(parts, backend):
+    tot = new_stats(backend)
+    for st in parts:
+        for k, v in st.items():
+            if isinstance(v, bool) or k in ("backend", "llm_error"):
+                continue
+            if isinstance(v, (int, float)) and k in tot:
+                tot[k] = round(tot[k] + v, 6) if isinstance(v, float) else tot[k] + v
+            elif isinstance(v, dict) and k in tot:
+                for kk, vv in v.items():
+                    tot[k][kk] = tot[k].get(kk, 0) + vv
+        tot["rate_limited"] = tot["rate_limited"] or st.get("rate_limited", False)
+        tot["llm_error"] = tot["llm_error"] or st.get("llm_error")
+    return tot
+
+
+def run_team(args, prompt, container, run_dir, result, test_files, checkpoint):
+    started = time.time()
+    deadline = started + args.agent_timeout
+    agent_log = os.path.join(run_dir, "agent.jsonl")
+    shared = new_stats(args.driver)  # episode-level stats (visible-test runs share the episode)
+    episode = Episode(Sandbox(container, os.path.join(run_dir, "exec.jsonl")), test_files, shared)
+    inv = TeamAgent("investigator", INVESTIGATOR_SYSTEM, episode, args.driver,
+                    args.investigator_max_tokens, args.compact_chars)
+    ed = TeamAgent("editor", EDITOR_SYSTEM, episode, args.driver, args.editor_max_tokens, args.compact_chars)
+    team = {"handoffs": 0, "model_reported": None, "turn_limit": args.max_turns, "events": []}
+    client = None
+    active, other = inv, ed
+    inv.wake(prompt.replace("Use the tools read_file, edit_file, run and finish.\n",
+                            "Use your tools read_file, run and handoff.\n").replace(
+        "Call finish when the fix is done.\n", "Call handoff to the editor when you know the fix.\n"))
+    inv_nudged = False
+    stop_reason = "turn_limit"
+    try:
+        client = Client(args.driver, args.openai_base, args.model, args.max_tokens_per_turn,
+                        key_cmd=args.key_helper, num_ctx=args.num_ctx)
+        while inv.stats["turns"] + ed.stats["turns"] < args.max_turns:
+            if time.time() >= deadline:
+                stop_reason = "timeout"
+                break
+            checkpoint()
+            if (active is inv and not inv_nudged and not ed.woken_once
+                    and inv.stats["turns"] >= args.investigator_turn_budget):
+                inv.messages.append({"role": "user", "content":
+                                     "Investigation turn budget reached. Call handoff now with your best findings."})
+                inv_nudged = True
+            outcome, text = team_step(client, active, deadline, agent_log, args.max_handoffs, team)
+            if (outcome == "continue" and active is inv and not ed.woken_once
+                    and inv.stats["turns"] >= args.investigator_turn_budget + args.investigator_grace_turns):
+                # Hard cap: the investigator ignored the nudge. Hand off its own notes so the
+                # editor can still act; counted as a forced handoff, not an agent handoff.
+                notes = [m.get("content") for m in inv.messages if m.get("role") == "assistant" and m.get("content")]
+                cmds = []
+                for m in inv.messages:
+                    for c in m.get("tool_calls") or []:
+                        cmds.append("%s %s" % ((c.get("function") or {}).get("name"), (c.get("function") or {}).get("arguments", "")[:160]))
+                text = ("[forced handoff: investigator turn cap reached]\nInvestigator notes:\n%s\n\nInvestigator's last tool calls:\n%s"
+                        % (clip("\n".join(notes[-3:]), 3000) or "(none)", "\n".join(cmds[-8:])))
+                team["forced_handoffs"] = team.get("forced_handoffs", 0) + 1
+                outcome = "handoff"
+            if outcome == "done":
+                stop_reason = "finish_accepted" if episode.tests_passed else "finish_rejected_final"
+                break
+            if outcome == "handoff":
+                header = "Handoff from the %s:\n%s" % (active.name, text)
+                if not other.woken_once and other is ed:
+                    header = "TASK:\n" + prompt + "\n\n" + header
+                team["events"].append({"t": round(time.time() - started, 2), "from": active.name,
+                                       "to": other.name, "chars": len(text)})
+                active.park()
+                other.wake(header)
+                active, other = other, active
+    except RateLimited:
+        active.stats["rate_limited"] = True
+        active.stats["llm_error"] = "HTTP 429"
+        stop_reason = "rate_limited"
+    except LLMError as exc:
+        active.stats["llm_error"] = str(exc).split(":", 1)[0][:80]
+        stop_reason = "llm_error"
+    finally:
+        inv.close()
+        ed.close()
+        per_agent = {}
+        for a in (inv, ed):
+            st = a.stats
+            st["llm_sec"] = round(st["llm_sec"], 3)
+            tot = st["valid_tool_calls"] + st["invalid_tool_calls"]
+            st["tool_call_success_rate"] = round(st["valid_tool_calls"] / tot, 3) if tot else None
+            st["max_tokens_per_turn"] = a.max_tokens
+            per_agent[a.name] = st
+        team_stats = _sum_stats(list(per_agent.values()), args.driver)
+        tot = team_stats["valid_tool_calls"] + team_stats["invalid_tool_calls"]
+        team_stats["tool_call_success_rate"] = round(team_stats["valid_tool_calls"] / tot, 3) if tot else None
+        team_stats["llm_requests"] = client.requests if client else 0
+        team_stats["rate_limit_hits"] = client.rate_limit_hits if client else 0
+        team_stats["handoffs"] = team["handoffs"]
+        team_stats["forced_handoffs"] = team.get("forced_handoffs", 0)
+        team_stats["handoff_events"] = team["events"]
+        team_stats["finish_accepted"] = episode.done and bool(episode.tests_passed)
+        team_stats["edits"] = episode.edits
+        team_stats["stop_reason"] = stop_reason
+        team_stats["turn_limit_pooled"] = args.max_turns
+        result["layout"] = "team2"
+        result["agents"] = per_agent
+        result["timings"]["agent_sec"] = round(time.time() - started, 3)
+        result["model_reported"] = team.get("model_reported")
+        result["llm_stats"] = team_stats
         result["exec_calls"] = _count_logged(os.path.join(run_dir, "exec.jsonl"))
