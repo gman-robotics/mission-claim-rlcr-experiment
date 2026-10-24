@@ -323,8 +323,8 @@ def parse_args(argv):
     parser.add_argument("--instance", required=True, help="Path to instance JSON")
     parser.add_argument("--mode", choices=("agent", "gold"), default="agent")
     parser.add_argument("--model", default="haiku")
-    parser.add_argument("--agent-timeout", type=int, default=1200)
-    parser.add_argument("--max-turns", type=int, default=40)
+    parser.add_argument("--agent-timeout", type=int, default=14400, help="hang guard only (plan: 14400 s); hits logged as guard_stop")
+    parser.add_argument("--max-turns", type=int, default=200, help="hang guard only (plan: 200 turns); hits logged as guard_stop")
     parser.add_argument(
         "--logs-root",
         default="/Users/Shared/gman-sandbox/mission-claim-rlcr/runs",
@@ -333,6 +333,12 @@ def parse_args(argv):
     parser.add_argument("--driver", choices=("claude", "openrouter", "ollama"), default="claude")
     parser.add_argument("--key-helper", default=os.path.expanduser("~/.grok/bin/openrouter-token"))
     parser.add_argument("--compact-chars", type=int, default=120000, help="history budget before old tool results are compacted")
+    parser.add_argument("--team", action="store_true", help="MCA 2-agent team: investigator + editor")
+    parser.add_argument("--investigator-max-tokens", type=int, default=2048)
+    parser.add_argument("--editor-max-tokens", type=int, default=4096)
+    parser.add_argument("--max-handoffs", type=int, default=6)
+    parser.add_argument("--investigator-turn-budget", type=int, default=12)
+    parser.add_argument("--investigator-grace-turns", type=int, default=3, help="turns after the nudge before a forced handoff")
     parser.add_argument("--text-fallback", action="store_true", help="last resort: parse tool JSON from text (counted)")
     parser.add_argument("--openai-base", default=None, help="default: OpenRouter v1 for openrouter, http://127.0.0.1:11434 for ollama")
     parser.add_argument("--max-tokens-per-turn", type=int, default=2048)
@@ -478,6 +484,7 @@ def parse_pytest_summary(text):
 
 PASS_STATUSES = ("PASSED", "XFAIL")
 INVALID_ID = "IGNORED_INVALID_ID"
+AMBIGUOUS = "AMBIGUOUS_PREFIX"
 
 
 def _prefix_hit(key, test_id):
@@ -506,6 +513,11 @@ def map_ids(ids, found):
         hits = [status for key, status in found.items() if _prefix_hit(key, test_id)]
         if not hits:
             mapped[test_id] = "MISSING"
+            continue
+        if "[" in test_id and len(hits) > 1:
+            # Cut inside a parametrization and more than one node continues it: we cannot tell
+            # which node the dataset meant, so do not let a sibling vouch for it.
+            mapped[test_id] = AMBIGUOUS
             continue
         bad = [h for h in hits if h not in PASS_STATUSES]
         mapped[test_id] = bad[0] if bad else ("XFAIL" if "XFAIL" in hits else "PASSED")
@@ -905,14 +917,22 @@ def run_claude(args, prompt, container, run_dir, result):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def visible_test_files(p2p_ids):
+    """Test files for the in-episode finish check. Ids without '::' (e.g. '[100%]') are dataset
+    artifacts, not files; passing them to pytest makes every finish fail with rc=4."""
+    return sorted({i.split("::")[0] for i in p2p_ids if "::" in i})
+
+
 def run_agent(args, prompt, container, run_dir, result):
     if args.driver in ("openrouter", "ollama"):
         import lesser_driver
-        files = sorted({i.split("::")[0] for i in args.p2p_ids})
+        files = visible_test_files(args.p2p_ids)
         prompt = prompt.replace(
             "Your only tool is exec. Use it to inspect the code and apply a fix.\n",
             "Use the tools read_file, edit_file, run and finish.\n").replace(
             "Finish when the fix is done.\n", "Call finish when the fix is done.\n")
+        if getattr(args, "team", False):
+            return lesser_driver.run_team(args, prompt, container, run_dir, result, files, checkpoint)
         return lesser_driver.run(args, prompt, container, run_dir, result, files, checkpoint)
     return run_claude(args, prompt, container, run_dir, result)
 
