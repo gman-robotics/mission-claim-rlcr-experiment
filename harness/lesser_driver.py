@@ -27,7 +27,8 @@ SYSTEM = (
     "1. Investigate with run (grep, ls) and read_file before changing anything.\n"
     "2. You must read_file a file before edit_file on it. edit_file replaces an exact, unique snippet.\n"
     "3. Make a minimal source fix. Do not modify tests.\n"
-    "4. Call finish when done. The harness then runs the existing tests; finish is rejected if they fail.\n"
+    "4. run is read-only: no redirects, sed -i, mv, cp, tee or scripts that write files. Use edit_file.\n"
+    "5. Call finish when done. The harness then runs the existing tests; finish is rejected if they fail.\n"
 )
 
 def _fn(name, desc, props, required):
@@ -47,6 +48,51 @@ TOOLS = [
         {"summary": {"type": "string"}}, ["summary"]),
 ]
 TOOL_NAMES = {t["function"]["name"] for t in TOOLS}
+
+
+WRITE_PATTERNS = [
+    (r"\bsed\b[^|;&]*\s-[a-zA-Z]*i", "sed -i"),
+    (r"\bperl\b[^|;&]*\s-[a-zA-Z]*i", "perl -i"),
+    (r"\btee\b", "tee"),
+    (r"\b(mv|cp|rm|install|truncate|dd|ln|touch|chmod)\b", "file mutation command"),
+    (r"\bgit\s+(apply|am|checkout|restore|reset|stash|clean|commit|rm|mv)\b", "git write"),
+    (r"(^|[;&|\s])patch\b", "patch"),
+    (r"open\([^)]*,\s*['\"][wax+]", "python file write"),
+    (r"\.write_(text|bytes)\(", "python file write"),
+    (r"\b(shutil|os)\.(copy|move|remove|unlink|rename|replace)", "python file mutation"),
+]
+_SAFE_REDIRECT = re.compile(r"\d?>>?\s*(/dev/null|/tmp/\S*)|\d?>&\d|&>\s*/dev/null")
+
+
+def write_violation(command):
+    """Return a reason if a run command looks like it writes files (edits must go through edit_file)."""
+    stripped = _SAFE_REDIRECT.sub(" ", command)
+    stripped = re.sub(r"'[^']*'|\"[^\"]*\"", lambda m: m.group(0) if re.search(r"open\(|write_", m.group(0)) else "''", stripped)
+    if re.search(r"(?<![<>=!-])>>?(?!=)", stripped):
+        return "output redirect to a file"
+    for pat, why in WRITE_PATTERNS:
+        if re.search(pat, stripped):
+            return why
+    return None
+
+
+def compact(messages, budget_chars, keep_tail=8):
+    """Shrink old tool results (never the system/task prompt or the last keep_tail messages).
+    Tool-call/result pairing is preserved; only content is replaced. Returns chars saved."""
+    total = sum(len(m.get("content") or "") for m in messages)
+    if total <= budget_chars:
+        return 0
+    saved = 0
+    for m in messages[2:max(2, len(messages) - keep_tail)]:
+        c = m.get("content") or ""
+        if m.get("role") == "tool" and len(c) > 400 and not c.startswith("[compacted"):
+            first = c.splitlines()[0][:160] if c else ""
+            m["content"] = "[compacted %d chars] %s" % (len(c), first)
+            saved += len(c) - len(m["content"])
+            total -= len(c) - len(m["content"])
+            if total <= budget_chars * 0.7:
+                break
+    return saved
 
 
 class RateLimited(Exception):
@@ -234,9 +280,11 @@ class Episode:
     def visible_tests(self):
         if not self.test_files:
             return True, "no visible tests configured"
-        rc, out, err = self.sb.run("python3 -m pytest -q -p no:cacheprovider " + " ".join(self.test_files) + " 2>&1 | tail -30", 600)
+        rc, out, err = self.sb.run(
+            "source /opt/miniconda3/etc/profile.d/conda.sh 2>/dev/null && conda activate testbed 2>/dev/null; "
+            "python -m pytest -q -p no:cacheprovider " + " ".join(self.test_files) + " 2>&1 | tail -30", 900)
         tail = out.strip().splitlines()[-1:] or [""]
-        ok = bool(re.search(r"\d+ passed", tail[0])) and not re.search(r"failed|error", tail[0])
+        ok = bool(re.search(r"\d+ passed", tail[0])) and not re.search(r"\b\d+ (failed|errors?)\b", tail[0])
         return ok, out
 
     def call(self, name, raw_args):
@@ -259,6 +307,11 @@ class Episode:
         self.stats["valid_tool_calls"] += 1
         self.stats["by_tool"][name] = self.stats["by_tool"].get(name, 0) + 1
         if name == "run":
+            why = write_violation(args["command"])
+            if why:
+                self.stats["protocol_rejections"]["run_write_blocked"] += 1
+                self.sb.log("run_blocked", args["command"], None, "", why)
+                return "REJECTED: run is read-only (%s). Use edit_file to change files; scratch output may go to /tmp." % why
             rc, out, err = self.sb.run(args["command"])
             return "rc=%s\nstdout:\n%s\nstderr:\n%s" % (rc, clip(out), clip(err, 3000))
         if name == "read_file":
@@ -332,6 +385,10 @@ def step(client, slot, stats, deadline, text_fallback, agent_log):
     if slot.parked:
         stats["parked_skips"] += 1
         return False
+    saved = compact(slot.messages, getattr(slot, "budget_chars", 120000))
+    if saved:
+        stats["compactions"] += 1
+        stats["compacted_chars"] += saved
     t = time.time()
     msg, usage, model = client.chat(slot.messages, timeout=max(10, min(300, deadline - time.time())))
     stats["llm_sec"] += time.time() - t
@@ -365,12 +422,14 @@ def run(args, prompt, container, run_dir, result, test_files, checkpoint):
              "llm_sec": 0.0, "valid_tool_calls": 0, "invalid_tool_calls": 0, "fallback_tool_calls": 0,
              "no_tool_turns": 0, "parked_skips": 0, "by_tool": {}, "rate_limited": False, "llm_error": None,
              "protocol_rejections": {"edit_unread": 0, "edit_tests": 0, "edit_not_unique": 0,
-                                     "finish_no_edit": 0, "finish_tests_failed": 0}}
+                                     "finish_no_edit": 0, "finish_tests_failed": 0, "run_write_blocked": 0},
+             "compactions": 0, "compacted_chars": 0}
     started = time.time()
     deadline = started + args.agent_timeout
     client = None
     episode = Episode(Sandbox(container, os.path.join(run_dir, "exec.jsonl")), test_files, stats)
     slot = AgentSlot("solo", SYSTEM, episode)
+    slot.budget_chars = getattr(args, "compact_chars", 120000)
     slot.wake(prompt)
     try:
         client = Client(args.driver, args.openai_base, args.model, args.max_tokens_per_turn,
