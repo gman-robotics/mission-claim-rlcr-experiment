@@ -9,8 +9,12 @@
 > - In section 2: the `post_message` and handoff details of the turn contract, and the board-message rule.
 > - Units 3, 4 and 5 (tool lists) and unit 7 in section 3.
 > - The "2 squads" lines in sections 4 and 5.
->- In section 2: the turn-contract sentence that the shared client serves "both team squads" (it serves the Commander and all N squads), and the peer-verification sentence that the reviewer is "the other laguna squad" (it is a different squad, chosen per A1-2).
+> - In section 2: the turn-contract sentence that the shared client serves "both team squads" (it serves the Commander and all N squads), and the peer-verification sentence that the reviewer is "the other laguna squad" (it is a different squad, chosen per A1-2).
+> - The Leadership Capital cost line in section 1 (adds `reassign`), and the `Phase` line in section 2 (adds `ASSIGNED`).
+> - The unit 4 board order in section 3, and the unit 7 "2 squads" estimate row in section 4.
 > - Open question 7.
+>
+> **Direction settled (Tom, 2026-10-26 8:34 AM MT: "Approve the direction on mission-claim #8").** The model Commander on laguna plus 2 to 4 squads is approved. Review objections to the direction itself (model vs. code Commander, same model, squad range) are closed by that approval; only execution and writing points stay open.
 >
 > The architecture plan carries inline A1 notes at each of those places. Everything else stays in force.
 
@@ -102,13 +106,13 @@ def run_team(session, runtime, cfg, instance) -> TeamOutcome:
 
 **Squad prompt contract (role-neutral, same for every squad, differs only in `squad_id`):** bid on intents with confidence and a short rationale; `claim` an intent only after it is assigned to you; work only on claimed intents; `finish` when the visible tests pass (this posts `WorkDone` with `files`, `tests_run` and an `evidence_ref`); after a `Pass` peer verdict, post `report` (`OwnershipReport`); use `ask_commander` instead of guessing.
 
-**Reviewer prompt (a different prompt, as the architecture plan's peer-review section and open question 11 require):** a verify turn runs on a fresh `history_id` (I-Fresh-Checker, anchors:118) with a separate reviewer system prompt. That prompt says: you did not write this change; check the diff against the intent and the tests; you may `read_file` and `run` (read-only); you may not edit; answer with `verify` only.
+**Reviewer prompt (a different prompt, as the architecture plan's peer-review section and open question 11 require):** a verify turn runs on a fresh `history_id` (I-Fresh-Checker, anchors:118) with a separate reviewer system prompt. That prompt says: you did not write this change; check the diff against the intent and the tests; you may `read_file` and `run` (read-only); you may not edit; answer with `verify` only. On a verify turn the harness narrows that squad's tool list to `read_file`, `run` and `verify` (no `edit_file`, `finish`, `bid`, `claim`, `report` or `ask_commander`); `run` keeps the write guard.
 
 ## 3. Tools and messages between the Commander and squads; assignment and hand-back
 
 All messages go through the board as structured tool calls validated by `parse` (architecture plan section 2: "the only door in"). The message types are the ones already planned (`MissionIntent`, `Bid`, `Claim`, `PeerVerification`, `OwnershipReport`, `Envelope`), plus six new ones:
 - `Assignment(mission_id, squad_id, notes)`: the Commander's acceptance of a bid. It replaces the code-side `BidAccepted`.
-- `WorkDone(mission_id, squad_id, status, files, tests_run, evidence_ref, repeat_failure)`: posted by the harness when a squad's `finish` is accepted or rejected for the last time, or when `repeat_failure` ends the assignment.
+- `WorkDone(mission_id, squad_id, status, files, tests_run, evidence_ref, repeat_failure)`: posted by the harness when a squad's `finish` is accepted or rejected for the last time, when `repeat_failure` ends the assignment, or when the squad hits its turn guard (`status=guard_stop`, section 5).
 - `ReviewRequest(mission_id, reviewer_squad)`: posted by `request_review`.
 - `Question(mission_id, squad_id, text)` (posted by `ask_commander`) and `Answer(mission_id, squad_id, text)` (posted by the Commander's `answer`).
 - `Close(mission_id, reason)`: `close_mission`.
